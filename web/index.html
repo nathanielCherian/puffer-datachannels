@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Puffer DataChannels</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Puffer DataChannels <small>video over an unreliable DataChannel</small></h1>
+  <div class="controls">
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+    <details class="settings">
+      <summary>Settings</summary>
+      <label>Bitrate (kbps, blank = server default) <input id="bitrate" type="number" min="100" step="100"></label>
+      <label>Minimum playout delay (ms) <input id="minDelay" type="number" value="0" min="0" step="10"></label>
+      <label>Give up on a late frame after (ms) <input id="maxWait" type="number" value="300" min="0" step="50"></label>
+      <label><input id="nack" type="checkbox" checked> Ask for lost packets again (NACK)</label>
+      <label>STUN URL (optional) <input id="stun" type="text" placeholder="stun:stun.l.google.com:19302"></label>
+    </details>
+  </div>
+  <div id="status" class="status">idle</div>
+</header>
+
+<main>
+  <section class="player">
+    <canvas id="video" width="1280" height="720"></canvas>
+    <div id="tiles" class="tiles"></div>
+  </section>
+
+  <section class="charts">
+    <figure><figcaption>Bitrate (kbps)</figcaption><canvas id="c-bitrate"></canvas></figure>
+    <figure><figcaption>Delay (ms)</figcaption><canvas id="c-delay"></canvas></figure>
+    <figure><figcaption>Frames per second</figcaption><canvas id="c-frames"></canvas></figure>
+  </section>
+
+  <section class="tables">
+    <details open><summary>Events</summary><ol id="events" class="events"></ol></details>
+    <details><summary>Client: latest stats</summary><pre id="t-client"></pre></details>
+    <details><summary>Server: latest snapshot</summary><pre id="t-server"></pre></details>
+  </section>
+</main>
+<script src="chart.js"></script>
+<script src="wire.js"></script>
+<script src="jitterbuffer.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
