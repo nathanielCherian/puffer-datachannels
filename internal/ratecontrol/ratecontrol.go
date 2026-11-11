@@ -22,6 +22,7 @@ type SentPacket struct {
 	Size     int    // DataChannel message bytes (header + payload); SCTP/DTLS/UDP/IP add roughly 93 more
 	SendTime time.Time
 	FrameID  uint32
+	Audio    bool // an Opus packet (FrameID then counts audio packets)
 	Key      bool // part of a keyframe
 	Rtx      bool // a NACK retransmission
 }

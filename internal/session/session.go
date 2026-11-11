@@ -1,6 +1,6 @@
 // Package session owns one viewer: its PeerConnection (DataChannels only),
-// the ffmpeg decode pipeline, the x264 encoder, and the sender that paces
-// frames onto the "media" DataChannel.
+// the ffmpeg pipeline (decoded video, Opus audio), the x264 encoder, and the
+// sender that paces both onto the "media" DataChannel.
 package session
 
 import (
@@ -35,7 +35,9 @@ type Config struct {
 	Controller                           string
 	StartBitrate, MinBitrate, MaxBitrate int // bps
 	PacingFactor                         float64
-	Headroom                             float64 // encoder bitrate = Headroom x controller target
+	Headroom                             float64 // video encoder bitrate = Headroom x controller target, less audio
+	Audio                                bool
+	AudioBitrate                         int     // bps, Opus
 	KeyIntSec                            float64 // 0 = IDR only on request
 	X264Preset                           string
 	X264Threads                          int
@@ -142,6 +144,10 @@ type Session struct {
 	ctrlDC  atomic.Pointer[webrtc.DataChannel] // reliable: hello, snapshots, the page's stats
 
 	enc         *x264.Encoder
+	audioOn     bool          // audio is enabled and the source has some
+	mediaStart  time.Time     // wall time of media time zero; valid once mediaReady is closed
+	mediaReady  chan struct{} // closed when the first video frame has been read
+	audWin      audioWindow
 	forceIDR    atomic.Bool
 	keyRequests atomic.Int64
 	started     atomic.Bool
@@ -150,6 +156,14 @@ type Session struct {
 	encTotal    encWindow
 
 	closeOnce sync.Once
+}
+
+// audioWindow is what the audio loop saw since the last snapshot. Lag is how
+// long after its nominal capture time a packet came out of ffmpeg.
+type audioWindow struct {
+	Packets        int
+	Bytes          int64
+	LagSum, LagMax float64 // ms
 }
 
 type encWindow struct {
@@ -191,7 +205,8 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		return nil, err
 	}
 
-	s := &Session{id: newID(), mgr: m, cfg: cfg, info: m.info, created: time.Now(), ctrl: ctrl}
+	s := &Session{id: newID(), mgr: m, cfg: cfg, info: m.info, created: time.Now(), ctrl: ctrl,
+		audioOn: cfg.Audio && m.info.HasAudio && cfg.AudioBitrate > 0, mediaReady: make(chan struct{})}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if s.log, err = logs.NewSession(cfg.LogDir, s.id); err != nil {
 		return nil, fmt.Errorf("create log: %w", err)
@@ -223,9 +238,9 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		"offer": req.SDP, "answer": ld.SDP,
 		"files": map[string]string{
 			"events.jsonl":    "server state changes (pc/ice states, channels, media start, keyframe requests, dropped frames, close)",
-			"cc.jsonl":        "the rate controller's inputs: sent (every DATA packet: seq, len, frame, rtx) and feedback (per-packet results with browser receive times, RTT, target and pacing rate afterwards)",
-			"encoder.jsonl":   "every encoded frame (id, bytes, keyframe, encode time, configured bitrate, whether it was sent) and every encoder reconfiguration",
-			"snapshots.jsonl": "periodic server snapshot (sender counters, pacer queue, rates, encoder window, SCTP buffered amount)",
+			"cc.jsonl":        "the rate controller's inputs: sent (every DATA packet: seq, len, frame, rtx, audio) and feedback (per-packet results with browser receive times, RTT, target and pacing rate afterwards)",
+			"encoder.jsonl":   "every encoded video frame (id, bytes, keyframe, encode time, configured bitrate, whether it was sent) and every encoder reconfiguration",
+			"snapshots.jsonl": "periodic server snapshot (sender counters, pacer queue, rates, encoder window, audio, SCTP buffered amount)",
 			"client.jsonl":    "what the page reported over the ctrl channel (t = server receive time)",
 		},
 	})
@@ -271,6 +286,8 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 				s.sendCtrl(map[string]any{
 					"type": "hello", "sessionId": s.id, "serverTimeMs": logs.NowMs(), "logDir": s.log.Dir,
 					"media": s.info, "config": s.cfg, "feedbackIntervalMs": ms(s.cfg.FeedbackInterval),
+					"audio": map[string]any{"enabled": s.audioOn, "bitrate": s.cfg.AudioBitrate, "sampleRate": mediasrc.AudioRate,
+						"channels": 2, "frameMs": ms(mediasrc.AudioFrame)},
 				})
 			})
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) { s.onCtrlMessage(msg.Data) })
@@ -368,7 +385,11 @@ func (s *Session) run(dc *webrtc.DataChannel) {
 	}, s.cfg.LogPackets, func(kind string, t time.Time, data any) { s.log.LogAt("cc", t, kind, data) })
 	s.snd.Store(snd)
 
-	pipe, err := mediasrc.StartPipeline(s.ctx, s.info)
+	audioBitrate := 0
+	if s.audioOn {
+		audioBitrate = s.cfg.AudioBitrate
+	}
+	pipe, err := mediasrc.StartPipeline(s.ctx, s.info, audioBitrate)
 	if err != nil {
 		s.Close("pipeline: " + err.Error())
 		return
@@ -381,13 +402,22 @@ func (s *Session) run(dc *webrtc.DataChannel) {
 	s.encWin.since = time.Now()
 	go snd.run(s.ctx)
 	go s.videoLoop(pipe, snd)
+	if s.audioOn {
+		go s.audioLoop(pipe, snd)
+	}
 	go s.bitrateLoop()
 	go s.snapshotLoop(dc, snd)
 }
 
-// videoBitrateFor converts the controller's target into an encoder target.
+// videoBitrateFor converts the controller's target, which is for everything
+// sent, into a target for the video encoder.
 func (s *Session) videoBitrateFor(target int) int {
-	return max(int(float64(target)*s.cfg.Headroom), 30_000)
+	v := int(float64(target) * s.cfg.Headroom)
+	if s.audioOn {
+		perSec := int(time.Second / mediasrc.AudioFrame)
+		v -= s.cfg.AudioBitrate + perSec*wire.DataHeaderLen*8
+	}
+	return max(v, 30_000)
 }
 
 // bitrateLoop follows the controller's target. With the fixed controller it
@@ -421,14 +451,18 @@ func (s *Session) bitrateLoop() {
 func (s *Session) videoLoop(pipe *mediasrc.Pipeline, snd *sender) {
 	frameDur := time.Duration(float64(time.Second) * float64(s.info.FPSDen) / float64(s.info.FPSNum))
 	buf := make([]byte, s.enc.FrameSize())
-	start := time.Now()
 	var frameID uint32
 	for n := 0; ; n++ {
 		if err := pipe.ReadVideoFrame(buf); err != nil {
 			s.Close("video read: " + err.Error())
 			return
 		}
-		if !sleepUntil(s.ctx, start.Add(time.Duration(n)*frameDur)) {
+		if n == 0 {
+			// Media time zero is now. Audio is stamped against the same origin.
+			s.mediaStart = time.Now()
+			close(s.mediaReady)
+		}
+		if !sleepUntil(s.ctx, s.mediaStart.Add(time.Duration(n)*frameDur)) {
 			return
 		}
 		forced := s.forceIDR.Swap(false)
@@ -467,6 +501,56 @@ func (s *Session) videoLoop(pipe *mediasrc.Pipeline, snd *sender) {
 	}
 }
 
+// audioLoop forwards Opus packets as ffmpeg produces them. A packet's capture
+// time is its position in the stream on the video's timeline (media time zero
+// = the first video frame), not when it came out of the encoder, so the
+// browser can line the two up exactly.
+func (s *Session) audioLoop(pipe *mediasrc.Pipeline, snd *sender) {
+	r, preSkip, err := pipe.AudioReader()
+	if err != nil {
+		s.Close("audio open: " + err.Error())
+		return
+	}
+	select {
+	case <-s.ctx.Done():
+		return
+	case <-s.mediaReady:
+	}
+	const frameSamples = uint64(mediasrc.AudioRate * mediasrc.AudioFrame / time.Second)
+	var id uint32
+	var granule uint64 // samples decoded before this packet, pre-skip included
+	for {
+		page, hdr, err := r.ParseNextPage()
+		if err != nil {
+			s.Close("audio read: " + err.Error())
+			return
+		}
+		if len(page) >= 8 && string(page[:8]) == "OpusTags" {
+			continue
+		}
+		if hdr.GranulePosition != granule+frameSamples {
+			// Not one 20 ms packet per page: we could not split or time it.
+			s.event("audioSkipped", fmt.Sprintf("page granule %d after %d", hdr.GranulePosition, granule))
+			granule = hdr.GranulePosition
+			continue
+		}
+		capture := s.mediaStart.Add(time.Duration(int64(granule)-int64(preSkip)) * time.Second / mediasrc.AudioRate)
+		granule = hdr.GranulePosition
+		if !sleepUntil(s.ctx, capture) {
+			return
+		}
+		lag := ms(time.Since(capture))
+		snd.enqueueAudio(id, page, capture)
+		id++
+		s.encMu.Lock()
+		s.audWin.Packets++
+		s.audWin.Bytes += int64(len(page))
+		s.audWin.LagSum += lag
+		s.audWin.LagMax = max(s.audWin.LagMax, lag)
+		s.encMu.Unlock()
+	}
+}
+
 func sleepUntil(ctx context.Context, t time.Time) bool {
 	d := time.Until(t)
 	if d <= 0 {
@@ -485,7 +569,7 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 func (s *Session) snapshotLoop(dc *webrtc.DataChannel, snd *sender) {
 	t := time.NewTicker(s.cfg.SnapshotInterval)
 	defer t.Stop()
-	var prevBytes, prevRtx int64
+	var prevBytes, prevRtx, prevAudio int64
 	prevT := time.Now()
 	for {
 		select {
@@ -499,12 +583,24 @@ func (s *Session) snapshotLoop(dc *webrtc.DataChannel, snd *sender) {
 		c := snap["counters"].(senderCounters)
 		snap["sendBitrate"] = float64(c.Bytes-prevBytes) * 8 / dt
 		snap["rtxBitrate"] = float64(c.RtxBytes-prevRtx) * 8 / dt
-		prevBytes, prevRtx, prevT = c.Bytes, c.RtxBytes, now
+		snap["audioBitrate"] = float64(c.AudioBytes-prevAudio) * 8 / dt // on the wire, retransmissions included
+		prevBytes, prevRtx, prevAudio, prevT = c.Bytes, c.RtxBytes, c.AudioBytes, now
 
 		s.encMu.Lock()
 		w, total := s.encWin, s.encTotal
 		s.encWin = encWindow{since: now}
+		aw := s.audWin
+		s.audWin = audioWindow{}
 		s.encMu.Unlock()
+		if s.audioOn {
+			audio := map[string]any{"configuredBitrate": s.cfg.AudioBitrate, "packets": aw.Packets}
+			if aw.Packets > 0 {
+				audio["encodedBitrate"] = float64(aw.Bytes) * 8 / dt
+				audio["lagMs"] = aw.LagSum / float64(aw.Packets)
+				audio["lagMaxMs"] = aw.LagMax
+			}
+			snap["audio"] = audio
+		}
 		enc := map[string]any{"configuredBitrate": s.enc.Bitrate(), "frames": total.Frames, "keyframes": total.Keyframes, "bytes": total.Bytes}
 		if wdt := now.Sub(w.since).Seconds(); wdt > 0 && w.Frames > 0 {
 			enc["bitrate"] = float64(w.Bytes) * 8 / wdt

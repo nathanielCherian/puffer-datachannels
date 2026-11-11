@@ -8,18 +8,24 @@
 //	      [18:20] fragIdx u16 [20:22] fragCount u16 [22:30] captureUs i64 [30:] payload
 //	PONG  [0]=3 [1:5] id u32 [5:13] t1 f64 (echoed) [13:21] t2 i64 [21:29] t3 i64
 //
-// seq counts every DATA packet put on the wire, retransmissions included, so
-// feedback about a seq is about exactly one transmission. sendUs is the server
-// clock (Unix µs) when the packet left the pacer; captureUs is when the frame
-// entered the encoder. A frame is the Annex-B access unit split into
-// fragCount payloads.
+// seq counts every DATA packet put on the wire, audio and retransmissions
+// included, so feedback about a seq is about exactly one transmission. sendUs
+// is the server clock (Unix µs) when the packet left the pacer.
+//
+// Video (flag audio clear): a frame is the Annex-B access unit split into
+// fragCount payloads; captureUs is when it entered the encoder.
+// Audio (flag audio set): a frame is one Opus packet, always fragCount 1, with
+// its own frameId counter; captureUs is when its first sample would have been
+// captured, on the same timeline as video, so equal captureUs means "play
+// together".
 //
 // Browser -> server
 //
 //	PING      [0]=2  [1:5] id u32 [5:13] t1 f64 (browser ms)
 //	FEEDBACK  [0]=16 [1:5] fbSeq u32 [5:13] tSend f64 (browser ms) [13:15] n u16
 //	          then n x ([0:4] seq u32 [4:12] recvMs f64 (browser ms))
-//	NACK      [0]=17 [1:3] n u16, then n x ([0:4] frameId u32 [4:6] fragIdx u16)
+//	NACK      [0]=17 [1] stream (0 video, 1 audio) [2:4] n u16,
+//	          then n x ([0:4] frameId u32 [4:6] fragIdx u16)
 //	KEYREQ    [0]=18 [1:5] frameId u32 (newest frame the browser has seen)
 //
 // A NACK with fragIdx 0xFFFF asks for every fragment of the frame.
@@ -40,8 +46,12 @@ const (
 	TypeNack     = 17
 	TypeKeyReq   = 18
 
-	FlagKey = 1 << 0
-	FlagRtx = 1 << 1
+	FlagKey   = 1 << 0
+	FlagRtx   = 1 << 1
+	FlagAudio = 1 << 2
+
+	StreamVideo = 0
+	StreamAudio = 1
 
 	DataHeaderLen = 30
 	// MaxMessage keeps a message inside one SCTP DATA chunk: pion's SCTP MTU is
@@ -56,11 +66,14 @@ var ErrShort = errors.New("wire: short message")
 
 // NewData builds a DATA message. seq and sendUs are left zero: the pacer
 // stamps them with Stamp when the packet actually leaves.
-func NewData(frameID uint32, fragIdx, fragCount uint16, key bool, capture time.Time, payload []byte) []byte {
+func NewData(stream uint8, frameID uint32, fragIdx, fragCount uint16, key bool, capture time.Time, payload []byte) []byte {
 	b := make([]byte, DataHeaderLen+len(payload))
 	b[0] = TypeData
 	if key {
 		b[1] = FlagKey
+	}
+	if stream == StreamAudio {
+		b[1] |= FlagAudio
 	}
 	binary.BigEndian.PutUint32(b[14:], frameID)
 	binary.BigEndian.PutUint16(b[18:], fragIdx)
@@ -115,20 +128,20 @@ type NackItem struct {
 	FragIdx uint16
 }
 
-func ParseNack(b []byte) ([]NackItem, error) {
-	if len(b) < 3 {
-		return nil, ErrShort
+func ParseNack(b []byte) (stream uint8, items []NackItem, err error) {
+	if len(b) < 4 {
+		return 0, nil, ErrShort
 	}
-	n := int(binary.BigEndian.Uint16(b[1:]))
-	if len(b) < 3+6*n {
-		return nil, ErrShort
+	n := int(binary.BigEndian.Uint16(b[2:]))
+	if len(b) < 4+6*n {
+		return 0, nil, ErrShort
 	}
-	items := make([]NackItem, n)
+	items = make([]NackItem, n)
 	for i := range items {
-		e := b[3+6*i:]
+		e := b[4+6*i:]
 		items[i] = NackItem{FrameID: binary.BigEndian.Uint32(e), FragIdx: binary.BigEndian.Uint16(e[4:])}
 	}
-	return items, nil
+	return b[1], items, nil
 }
 
 // Pong answers a PING (13 bytes) with the server's receive and send times.

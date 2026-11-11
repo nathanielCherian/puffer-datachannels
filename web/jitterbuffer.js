@@ -1,18 +1,21 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// The jitter buffer: everything between "a datagram arrived" and "decode this
-// frame now". It is deliberately self-contained so it can be replaced. The
-// page only uses:
+// The video jitter buffer: everything between "a datagram arrived" and "decode
+// this frame now". It is deliberately self-contained so it can be replaced.
+// The page only uses:
 //
-//   push(packet, now)   a DATA packet arrived (see Wire.parseData)
+//   push(packet, now)   a video DATA packet arrived (see Wire.parseData)
 //   tick(now)           send any NACKs that are due
 //   pop(now)            the next frame to decode, if its time has come, else null
 //   forceKeyframe(now)  the decoder failed: resynchronise on a keyframe
+//   ownOffsetMs()       playout time − capture time this buffer wants, or null
+//   syncOffsetMs        set by the page: the audio buffer's offset (lip sync)
 //   stats()
 //
 // and gives it three callbacks: sendNack(items), sendKeyRequest(frameId), and
-// rttMs(). `now` is always the page's wall clock in ms.
+// rttMs(). `now` is always the page's wall clock in ms. The audio buffer
+// (audio.js) has the same shape and shares DelayEstimator.
 //
 // What this one does:
 //
@@ -25,7 +28,9 @@
 // delay. d − baseline is that frame's lateness. The target delay is the 95th
 // percentile of lateness over the last 5 s plus a margin; it rises at once and
 // decays slowly. A frame is played at capture + baseline + target, which keeps
-// the capture spacing as long as the target holds still.
+// the capture spacing as long as the target holds still. If the audio buffer
+// needs a larger capture-to-playout offset, video uses that one instead, so
+// the two stay in sync.
 //
 // Order. The encoder emits no B-frames and every frame references the one
 // before it, so frames are released strictly in order and a missing frame
@@ -37,6 +42,35 @@
 // for a keyframe; a complete keyframe further on is always jumped to once its
 // playout time comes.
 // ---------------------------------------------------------------------------
+class DelayEstimator {
+  // o: minDelayMs, maxDelayMs, marginMs, quantile, windowMs, baseWindowMs, decay.
+  constructor(o) {
+    this.o = o;
+    this.samples = [];          // [time, d] of units that arrived without retransmission
+    this.baseMs = null;
+    this.targetMs = o.minDelayMs;
+  }
+
+  add(now, d) {
+    const o = this.o;
+    this.samples.push([now, d]);
+    while (now - this.samples[0][0] > o.baseWindowMs) this.samples.shift();
+    let base = Infinity;
+    for (const s of this.samples) if (s[1] < base) base = s[1];
+    this.baseMs = base;
+    const late = [];
+    for (let i = this.samples.length - 1; i >= 0 && now - this.samples[i][0] <= o.windowMs; i--) late.push(this.samples[i][1] - base);
+    late.sort((a, b) => a - b);
+    const q = late[Math.min(late.length - 1, Math.floor(o.quantile * late.length))];
+    const desired = Math.min(o.maxDelayMs, Math.max(o.minDelayMs, q + o.marginMs));
+    this.targetMs = desired > this.targetMs ? desired : this.targetMs + (desired - this.targetMs) * o.decay;
+  }
+
+  // Playout time − capture time (it includes the unknown clock offset), or
+  // null until something has arrived without retransmission.
+  offsetMs() { return this.baseMs === null ? null : this.baseMs + this.targetMs; }
+}
+
 class JitterBuffer {
   constructor(opts) {
     this.o = Object.assign({
@@ -63,9 +97,8 @@ class JitterBuffer {
     this.highest = -1;
     this.needKey = true;        // nothing decodable until a keyframe
     this.lastKeyReq = null;
-    this.samples = [];          // [time, d] of frames that arrived without retransmission
-    this.baseMs = null;
-    this.targetMs = this.o.minDelayMs;
+    this.est = new DelayEstimator(this.o);
+    this.syncOffsetMs = null;
     this.lastHoldMs = null;
     this.c = {
       packets: 0, duplicates: 0, latePackets: 0, framesComplete: 0, framesReleased: 0, framesSkipped: 0,
@@ -116,27 +149,24 @@ class JitterBuffer {
       // A retransmitted frame is late because of loss, not jitter: letting it
       // into the estimate would grow the delay to cover a NACK round trip.
       if (f.rtx || f.nackTries > 0) this.c.framesRecovered++;
-      else this._addSample(now, now - f.captureMs);
+      else this.est.add(now, now - f.captureMs);
     }
   }
 
-  _addSample(now, d) {
-    const o = this.o;
-    this.samples.push([now, d]);
-    while (now - this.samples[0][0] > o.baseWindowMs) this.samples.shift();
-    let base = Infinity;
-    for (const s of this.samples) if (s[1] < base) base = s[1];
-    this.baseMs = base;
-    const late = [];
-    for (let i = this.samples.length - 1; i >= 0 && now - this.samples[i][0] <= o.windowMs; i--) late.push(this.samples[i][1] - base);
-    late.sort((a, b) => a - b);
-    const q = late[Math.min(late.length - 1, Math.floor(o.quantile * late.length))];
-    const desired = Math.min(o.maxDelayMs, Math.max(o.minDelayMs, q + o.marginMs));
-    this.targetMs = desired > this.targetMs ? desired : this.targetMs + (desired - this.targetMs) * o.decay;
+  ownOffsetMs() { return this.est.offsetMs(); }
+
+  // The offset in use: this buffer's own or the audio buffer's, whichever is larger.
+  offsetMs() {
+    const own = this.est.offsetMs();
+    if (own === null || this.syncOffsetMs === null) return own === null ? this.syncOffsetMs : own;
+    return Math.max(own, this.syncOffsetMs);
   }
 
-  // Until a frame has arrived without retransmission there is no baseline: play at once.
-  _playoutAt(f) { return this.baseMs === null ? 0 : f.captureMs + this.baseMs + this.targetMs; }
+  // Until there is an offset (nothing has arrived without retransmission yet): play at once.
+  _playoutAt(f) {
+    const off = this.offsetMs();
+    return off === null ? 0 : f.captureMs + off;
+  }
 
   _firstCompleteKey() {
     for (const f of this.frames.values()) if (f.key && f.completeAt !== null) return f;
@@ -207,7 +237,8 @@ class JitterBuffer {
     const k = this._firstCompleteKey();
     if (k && now >= this._playoutAt(k)) return this._release(k, now);
     const captureMs = head && head.captureMs !== null ? head.captureMs : this.lastCaptureMs + this.o.frameIntervalMs;
-    const due = this.baseMs === null ? now : captureMs + this.baseMs + this.targetMs;
+    const off = this.offsetMs();
+    const due = off === null ? now : captureMs + off;
     if (now > due + (this.o.nack ? this.o.maxWaitMs : 0)) {
       this.c.framesAbandoned++;
       this.needKey = true;
@@ -237,7 +268,8 @@ class JitterBuffer {
   stats() {
     let complete = 0;
     for (const f of this.frames.values()) if (f.completeAt !== null) complete++;
-    return { targetMs: this.targetMs, holdMs: this.lastHoldMs, framesBuffered: this.frames.size, framesReady: complete,
+    const own = this.est.offsetMs(), off = this.offsetMs();
+    return { targetMs: this.est.targetMs, heldForAudioMs: own === null || off === null ? 0 : off - own, holdMs: this.lastHoldMs, framesBuffered: this.frames.size, framesReady: complete,
       waitingForKey: this.needKey, ...this.c };
   }
 }

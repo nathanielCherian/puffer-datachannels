@@ -50,7 +50,9 @@ func main() {
 		minBitrate   = flag.Int("min-bitrate", 100_000, "lowest bitrate a controller or a viewer may choose (bps)")
 		maxBitrate   = flag.Int("max-bitrate", 8_000_000, "highest bitrate a controller or a viewer may choose (bps)")
 		pacingFactor = flag.Float64("pacing-factor", 2.0, "pacer drain rate as a multiple of the bitrate")
-		headroom     = flag.Float64("headroom", 0.9, "fraction of the bitrate given to the encoder (the rest covers headers and retransmissions)")
+		headroom     = flag.Float64("headroom", 0.9, "fraction of the bitrate given to audio and the video encoder (the rest covers headers and retransmissions)")
+		audio        = flag.Bool("audio", true, "send the source's audio (Opus)")
+		audioBitrate = flag.Int("audio-bitrate", 64_000, "Opus bitrate (bps); it comes out of --bitrate")
 		keyintSec    = flag.Float64("keyint", 0, "seconds between periodic keyframes (0 = only when the browser asks)")
 		preset       = flag.String("x264-preset", "veryfast", "x264 preset")
 		threads      = flag.Int("x264-threads", 0, "x264 threads (0 = auto)")
@@ -84,7 +86,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("probe video: %v (generate a stand-in with `make standin`)", err)
 	}
-	log.Printf("source %s: %dx%d @ %.3f fps, %.1fs", info.Path, info.Width, info.Height, info.FPS, info.DurationSec)
+	log.Printf("source %s: %dx%d @ %.3f fps, %.1fs, audio: %v", info.Path, info.Width, info.Height, info.FPS, info.DurationSec, info.HasAudio)
 
 	se := webrtc.SettingEngine{}
 	session.Settings(&se, uint32(*sctpMinCwnd))
@@ -124,7 +126,7 @@ func main() {
 
 	cfg := session.Config{
 		Controller: *cc, StartBitrate: *bitrate, MinBitrate: *minBitrate, MaxBitrate: *maxBitrate,
-		PacingFactor: *pacingFactor, Headroom: *headroom, KeyIntSec: *keyintSec,
+		PacingFactor: *pacingFactor, Headroom: *headroom, Audio: *audio, AudioBitrate: *audioBitrate, KeyIntSec: *keyintSec,
 		X264Preset: *preset, X264Threads: *threads, MaxQueue: *maxQueue, History: *history,
 		FeedbackInterval: *fbInterval, SnapshotInterval: *snapInt, LogPackets: *logPackets,
 		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions, ICEServers: iceServers,

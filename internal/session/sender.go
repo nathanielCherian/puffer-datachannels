@@ -22,14 +22,15 @@ type sender struct {
 	cfg     senderConfig
 
 	mu          sync.Mutex
-	queue       []*packet // new media, FIFO
-	rtxQueue    []*packet // retransmissions, sent first
+	queue       []*packet // new video, FIFO
+	rtxQueue    []*packet // retransmissions, sent before new video
+	audioQueue  []*packet // audio, sent before everything: small and it cannot wait
 	queuedBytes int
 	nextSeq     uint32
 	sent        map[uint32]ratecontrol.SentPacket // on the wire, fate unknown
 	highestAck  int64                             // -1 until the first ack
-	history     map[uint32]*sentFrame
-	historyIDs  []uint32
+	history     map[frameKey]*sentFrame
+	historyIDs  []frameKey
 	rtt         time.Duration
 	c           senderCounters
 
@@ -45,9 +46,15 @@ type senderConfig struct {
 
 type packet struct {
 	buf     []byte
+	stream  uint8
 	frameID uint32
 	key     bool
 	rtx     bool
+}
+
+type frameKey struct {
+	stream uint8
+	id     uint32
 }
 
 type sentFrame struct {
@@ -58,7 +65,9 @@ type sentFrame struct {
 }
 
 type senderCounters struct {
-	Packets, Bytes       int64
+	Packets, Bytes       int64 // everything, audio and retransmissions included
+	AudioPackets         int64
+	AudioBytes           int64
 	RtxPackets, RtxBytes int64
 	Acked, Lost          int64
 	RepeatAcks           int64 // the second copy of a report, or an ack for a packet already declared lost
@@ -74,7 +83,7 @@ func newSender(write func([]byte) error, ctrl ratecontrol.Controller, cfg sender
 	logf func(string, time.Time, any)) *sender {
 	return &sender{
 		write: write, ctrl: ctrl, cfg: cfg, logf: logf, logPkts: logPkts,
-		sent: map[uint32]ratecontrol.SentPacket{}, history: map[uint32]*sentFrame{},
+		sent: map[uint32]ratecontrol.SentPacket{}, history: map[frameKey]*sentFrame{},
 		highestAck: -1, wake: make(chan struct{}, 1),
 	}
 }
@@ -95,8 +104,8 @@ func (s *sender) queueDelayLocked() time.Duration {
 	return time.Duration(float64(s.queuedBytes) * 8 / float64(rate) * float64(time.Second))
 }
 
-// enqueueFrame fragments one encoded frame and hands it to the pacer. It
-// returns false if the frame was dropped because the queue is too long; the
+// enqueueFrame fragments one encoded video frame and hands it to the pacer.
+// It returns false if the frame was dropped because the queue is too long; the
 // caller must then make the next frame a keyframe.
 func (s *sender) enqueueFrame(frameID uint32, data []byte, key bool, capture time.Time) bool {
 	s.mu.Lock()
@@ -105,17 +114,40 @@ func (s *sender) enqueueFrame(frameID uint32, data []byte, key bool, capture tim
 		s.c.FramesDropped++
 		return false
 	}
+	s.enqueueLocked(wire.StreamVideo, frameID, data, key, capture)
+	s.c.FramesQueued++
+	return true
+}
+
+// enqueueAudio hands one Opus packet to the pacer. Audio is never dropped
+// here: it is a small constant rate and goes out ahead of video.
+func (s *sender) enqueueAudio(id uint32, data []byte, capture time.Time) {
+	if len(data) == 0 || len(data) > wire.MaxPayload {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.enqueueLocked(wire.StreamAudio, id, data, false, capture)
+}
+
+func (s *sender) enqueueLocked(stream uint8, frameID uint32, data []byte, key bool, capture time.Time) {
 	n := (len(data) + wire.MaxPayload - 1) / wire.MaxPayload
 	f := &sentFrame{at: time.Now(), key: key, frags: make([][]byte, n), lastRtx: make([]time.Time, n)}
 	for i := 0; i < n; i++ {
 		end := min((i+1)*wire.MaxPayload, len(data))
-		buf := wire.NewData(frameID, uint16(i), uint16(n), key, capture, data[i*wire.MaxPayload:end])
+		buf := wire.NewData(stream, frameID, uint16(i), uint16(n), key, capture, data[i*wire.MaxPayload:end])
 		f.frags[i] = buf
-		s.queue = append(s.queue, &packet{buf: buf, frameID: frameID, key: key})
+		p := &packet{buf: buf, stream: stream, frameID: frameID, key: key}
+		if stream == wire.StreamAudio {
+			s.audioQueue = append(s.audioQueue, p)
+		} else {
+			s.queue = append(s.queue, p)
+		}
 		s.queuedBytes += len(buf)
 	}
-	s.history[frameID] = f
-	s.historyIDs = append(s.historyIDs, frameID)
+	k := frameKey{stream, frameID}
+	s.history[k] = f
+	s.historyIDs = append(s.historyIDs, k)
 	for len(s.historyIDs) > 0 {
 		id := s.historyIDs[0]
 		if f.at.Sub(s.history[id].at) <= s.cfg.History {
@@ -124,9 +156,7 @@ func (s *sender) enqueueFrame(frameID uint32, data []byte, key bool, capture tim
 		delete(s.history, id)
 		s.historyIDs = s.historyIDs[1:]
 	}
-	s.c.FramesQueued++
 	s.kick()
-	return true
 }
 
 // run is the pacer. It holds a byte budget that refills at the controller's
@@ -155,7 +185,7 @@ func (s *sender) run(ctx context.Context) {
 			budget -= float64(len(p.buf))
 			s.sendLocked(p)
 		}
-		empty := len(s.queue)+len(s.rtxQueue) == 0
+		empty := len(s.queue)+len(s.rtxQueue)+len(s.audioQueue) == 0
 		s.mu.Unlock()
 
 		wait := time.Hour
@@ -174,7 +204,9 @@ func (s *sender) run(ctx context.Context) {
 
 func (s *sender) popLocked() *packet {
 	q := &s.queue
-	if len(s.rtxQueue) > 0 {
+	if len(s.audioQueue) > 0 {
+		q = &s.audioQueue
+	} else if len(s.rtxQueue) > 0 {
 		q = &s.rtxQueue
 	}
 	if len(*q) == 0 {
@@ -196,17 +228,26 @@ func (s *sender) sendLocked(p *packet) {
 		s.c.WriteErrors++
 		return
 	}
-	sp := ratecontrol.SentPacket{Seq: seq, Size: len(p.buf), SendTime: now, FrameID: p.frameID, Key: p.key, Rtx: p.rtx}
+	audio := p.stream == wire.StreamAudio
+	sp := ratecontrol.SentPacket{Seq: seq, Size: len(p.buf), SendTime: now, FrameID: p.frameID, Audio: audio, Key: p.key, Rtx: p.rtx}
 	s.sent[seq] = sp
 	s.c.Packets++
 	s.c.Bytes += int64(len(p.buf))
+	if audio {
+		s.c.AudioPackets++
+		s.c.AudioBytes += int64(len(p.buf))
+	}
 	if p.rtx {
 		s.c.RtxPackets++
 		s.c.RtxBytes += int64(len(p.buf))
 	}
 	s.ctrl.OnPacketSent(sp)
 	if s.logPkts {
-		s.logf("sent", now, map[string]any{"seq": seq, "len": sp.Size, "frame": p.frameID, "rtx": p.rtx, "key": p.key})
+		rec := map[string]any{"seq": seq, "len": sp.Size, "frame": p.frameID, "rtx": p.rtx, "key": p.key}
+		if audio {
+			rec["audio"] = true
+		}
+		s.logf("sent", now, rec)
 	}
 }
 
@@ -272,7 +313,7 @@ func (s *sender) onFeedback(b []byte, arrival time.Time) {
 
 // onNack queues retransmissions for the fragments the browser asked for.
 func (s *sender) onNack(b []byte) {
-	items, err := wire.ParseNack(b)
+	stream, items, err := wire.ParseNack(b)
 	if err != nil {
 		return
 	}
@@ -282,7 +323,7 @@ func (s *sender) onNack(b []byte) {
 	now := time.Now()
 	for _, it := range items {
 		s.c.NackItems++
-		f := s.history[it.FrameID]
+		f := s.history[frameKey{stream, it.FrameID}]
 		if f == nil {
 			s.c.NackMisses++
 			continue
@@ -299,7 +340,7 @@ func (s *sender) onNack(b []byte) {
 			}
 			f.lastRtx[i] = now
 			buf := append([]byte(nil), f.frags[i]...)
-			s.rtxQueue = append(s.rtxQueue, &packet{buf: buf, frameID: it.FrameID, key: f.key, rtx: true})
+			s.rtxQueue = append(s.rtxQueue, &packet{buf: buf, stream: stream, frameID: it.FrameID, key: f.key, rtx: true})
 			s.queuedBytes += len(buf)
 		}
 	}

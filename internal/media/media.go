@@ -1,5 +1,5 @@
 // Package media probes the source file and runs the ffmpeg decode pipeline
-// (raw I420 video, looped in real time). Adapted from
+// (raw I420 video and Opus audio, looped in real time). Adapted from
 // github.com/nathanielCherian/webrtc-test (internal/session/pipeline.go).
 package media
 
@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -17,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
 // MediaInfo describes the source file, as probed by ffprobe.
@@ -166,42 +169,89 @@ func parseRate(s string) (int, int) {
 }
 
 // Pipeline runs one ffmpeg process that decodes the source (looping forever,
-// in real time) into raw I420 video on stdout.
+// in real time) into raw I420 video on stdout and, if asked, Opus audio (one
+// 20 ms packet per Ogg page) on fd 3.
 type Pipeline struct {
 	info   *Info
 	cmd    *exec.Cmd
 	video  io.ReadCloser
+	audio  *os.File // nil without audio
 	stderr *tailBuffer
 
 	FramesRead atomic.Int64
 }
 
-// StartPipeline launches ffmpeg.
-func StartPipeline(ctx context.Context, info *Info) (*Pipeline, error) {
+// AudioFrame is the duration of one Opus packet; AudioRate its sample rate.
+const (
+	AudioFrame = 20 * time.Millisecond
+	AudioRate  = 48000
+)
+
+// StartPipeline launches ffmpeg. audioBitrate 0 means video only.
+func StartPipeline(ctx context.Context, info *Info, audioBitrate int) (*Pipeline, error) {
 	vf := fmt.Sprintf("scale=%d:%d,fps=%d/%d,format=yuv420p", info.Width, info.Height, info.FPSNum, info.FPSDen)
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin",
 		"-re", "-stream_loop", "-1", "-i", info.Path,
-		"-map", "0:v:0", "-an", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1")
+		"-map", "0:v:0", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"}
+	if audioBitrate > 0 {
+		// aresample=async keeps the sample count in step with the timestamps (it
+		// pads or trims where the file loops), so audio position stays comparable
+		// with the video frame count for as long as the session runs.
+		args = append(args, "-map", "0:a:0", "-af", "aresample=async=1:first_pts=0",
+			"-c:a", "libopus", "-b:a", strconv.Itoa(audioBitrate), "-ar", strconv.Itoa(AudioRate), "-ac", "2",
+			"-frame_duration", "20", "-application", "lowdelay",
+			"-page_duration", "1", "-flush_packets", "1", "-f", "ogg", "pipe:3")
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	video, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr := &tailBuffer{max: 4096}
-	cmd.Stderr = stderr
+	p := &Pipeline{info: info, cmd: cmd, video: video, stderr: &tailBuffer{max: 4096}}
+	cmd.Stderr = p.stderr
 	cmd.WaitDelay = 2 * time.Second
-	if err := cmd.Start(); err != nil {
+	var aw *os.File
+	if audioBitrate > 0 {
+		if p.audio, aw, err = os.Pipe(); err != nil {
+			return nil, err
+		}
+		cmd.ExtraFiles = []*os.File{aw} // fd 3 in the child
+	}
+	err = cmd.Start()
+	if aw != nil {
+		aw.Close() // the child has its own copy
+	}
+	if err != nil {
+		if p.audio != nil {
+			p.audio.Close()
+		}
 		return nil, fmt.Errorf("start ffmpeg: %w", err)
 	}
-	return &Pipeline{info: info, cmd: cmd, video: video, stderr: stderr}, nil
+	return p, nil
+}
+
+// AudioReader returns the Opus stream's Ogg pages and its pre-skip: the
+// number of samples at the start of the decoded stream that precede media
+// time zero.
+func (p *Pipeline) AudioReader() (*oggreader.OggReader, int, error) {
+	r, hdr, err := oggreader.NewWith(p.audio)
+	if err != nil {
+		return nil, 0, p.wrapErr(err)
+	}
+	return r, int(hdr.PreSkip), nil
+}
+
+func (p *Pipeline) wrapErr(err error) error {
+	if msg := strings.TrimSpace(p.stderr.String()); msg != "" {
+		return fmt.Errorf("%w (ffmpeg: %s)", err, msg)
+	}
+	return err
 }
 
 // ReadVideoFrame reads exactly one I420 frame into buf.
 func (p *Pipeline) ReadVideoFrame(buf []byte) error {
 	if _, err := io.ReadFull(p.video, buf); err != nil {
-		if msg := strings.TrimSpace(p.stderr.String()); msg != "" {
-			return fmt.Errorf("%w (ffmpeg: %s)", err, msg)
-		}
-		return err
+		return p.wrapErr(err)
 	}
 	p.FramesRead.Add(1)
 	return nil
@@ -213,6 +263,9 @@ func (p *Pipeline) Close() {
 		_ = p.cmd.Process.Kill()
 	}
 	_ = p.cmd.Wait()
+	if p.audio != nil {
+		p.audio.Close()
+	}
 }
 
 // tailBuffer keeps the last max bytes written (ffmpeg stderr).

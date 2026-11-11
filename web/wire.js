@@ -4,7 +4,8 @@
 // description is internal/wire/wire.go; everything is big-endian.
 const Wire = {
   DATA: 1, PING: 2, PONG: 3, FEEDBACK: 16, NACK: 17, KEYREQ: 18,
-  FLAG_KEY: 1, FLAG_RTX: 2,
+  FLAG_KEY: 1, FLAG_RTX: 2, FLAG_AUDIO: 4,
+  VIDEO: 0, AUDIO: 1,
   DATA_HEADER: 30,
   WHOLE_FRAME: 0xFFFF,
   MAX_FEEDBACK_ACKS: 90, // keeps a feedback message inside one packet
@@ -17,6 +18,7 @@ const Wire = {
     return {
       key: (flags & Wire.FLAG_KEY) !== 0,
       rtx: (flags & Wire.FLAG_RTX) !== 0,
+      audio: (flags & Wire.FLAG_AUDIO) !== 0,
       seq: d.getUint32(2),
       sendMs: Number(d.getBigInt64(6)) / 1000,
       frameId: d.getUint32(14),
@@ -55,14 +57,15 @@ const Wire = {
     return d.buffer;
   },
 
-  // items: [[frameId, fragIdx], ...]
-  nack(items) {
-    const d = new DataView(new ArrayBuffer(3 + 6 * items.length));
+  // stream: Wire.VIDEO or Wire.AUDIO; items: [[frameId, fragIdx], ...]
+  nack(stream, items) {
+    const d = new DataView(new ArrayBuffer(4 + 6 * items.length));
     d.setUint8(0, Wire.NACK);
-    d.setUint16(1, items.length);
+    d.setUint8(1, stream);
+    d.setUint16(2, items.length);
     items.forEach(([frameId, fragIdx], i) => {
-      d.setUint32(3 + 6 * i, frameId);
-      d.setUint16(7 + 6 * i, fragIdx);
+      d.setUint32(4 + 6 * i, frameId);
+      d.setUint16(8 + 6 * i, fragIdx);
     });
     return d.buffer;
   },

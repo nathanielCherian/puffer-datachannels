@@ -95,7 +95,7 @@ func TestSenderPacingFeedbackAndNack(t *testing.T) {
 		t.Error("no RTT")
 	}
 
-	nack := []byte{wire.TypeNack, 0, 2, 0, 0, 0, 7, 0, 5, 0, 0, 0, 99, 0xFF, 0xFF} // frame 7 frag 5; all of frame 99 (unknown)
+	nack := []byte{wire.TypeNack, wire.StreamVideo, 0, 2, 0, 0, 0, 7, 0, 5, 0, 0, 0, 99, 0xFF, 0xFF} // frame 7 frag 5; all of frame 99 (unknown)
 	s.onNack(nack)
 	s.onNack(nack) // answered once only
 	time.Sleep(50 * time.Millisecond)
@@ -122,5 +122,44 @@ func TestSenderDropsWhenQueueIsLong(t *testing.T) {
 	}
 	if s.enqueueFrame(1, make([]byte, 1000), false, time.Now()) {
 		t.Fatal("second frame accepted behind a 200 ms queue")
+	}
+}
+
+// Audio leaves ahead of queued video, has its own id space, and is
+// retransmitted from its own history.
+func TestSenderAudioGoesFirst(t *testing.T) {
+	var mu sync.Mutex
+	var wrote [][]byte
+	s := newSender(func(b []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		wrote = append(wrote, append([]byte(nil), b...))
+		return nil
+	}, &recorder{}, senderConfig{MaxQueue: time.Second, History: time.Second}, false, nil)
+	s.enqueueFrame(3, make([]byte, wire.MaxPayload*30), true, time.Now()) // 135 ms at 2 Mbps
+	s.enqueueAudio(3, make([]byte, 160), time.Now())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.run(ctx)
+	time.Sleep(30 * time.Millisecond)
+	s.onNack([]byte{wire.TypeNack, wire.StreamAudio, 0, 1, 0, 0, 0, 3, 0, 0})
+	time.Sleep(30 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	var audio []int
+	for i, b := range wrote {
+		if b[1]&wire.FlagAudio != 0 {
+			audio = append(audio, i)
+			if len(b) != wire.DataHeaderLen+160 || binary.BigEndian.Uint32(b[14:]) != 3 {
+				t.Errorf("audio packet %d: len %d frame %d", i, len(b), binary.BigEndian.Uint32(b[14:]))
+			}
+		}
+	}
+	// The pacer may already hold one video packet's worth of debt when audio arrives.
+	if len(audio) != 2 || audio[0] > 1 || wrote[audio[1]][1]&wire.FlagRtx == 0 {
+		t.Fatalf("audio packets at %v of %d, want the original first and one retransmission", audio, len(wrote))
+	}
+	if len(wrote) >= 32 {
+		t.Errorf("all %d packets left in 60 ms: not paced", len(wrote))
 	}
 }

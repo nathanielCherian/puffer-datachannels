@@ -1,9 +1,10 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// The page: connects, feeds DATA packets to the jitter buffer, decodes what it
-// releases (WebCodecs) onto a canvas, and reports packet arrivals back to the
-// server. Chart, $, fmtNum and tilesHTML come from chart.js.
+// The page: connects, feeds DATA packets to the video and audio jitter
+// buffers, decodes what they release (WebCodecs) onto a canvas and the audio
+// device, and reports packet arrivals back to the server. Chart, $, fmtNum and
+// tilesHTML come from chart.js.
 // ---------------------------------------------------------------------------
 const S = { pc: null, timers: [] };
 const canvas = $('video');
@@ -19,9 +20,11 @@ const charts = {
     { key: 'encoded', name: 'encoder out' },
     { key: 'recv', name: 'client received' },
     { key: 'rtx', name: 'retransmissions' },
+    { key: 'audio', name: 'audio' },
   ]),
   delay: new Chart($('c-delay'), [
     { key: 'e2e', name: 'capture → render' },
+    { key: 'audioE2e', name: 'capture → heard (audio)' },
     { key: 'owd', name: 'network (server → client)' },
     { key: 'jbTarget', name: 'jitter buffer target' },
     { key: 'jbHold', name: 'time in jitter buffer' },
@@ -59,7 +62,8 @@ function sendMedia(buf) {
 
 $('start').onclick = start;
 $('stop').onclick = () => stop('stopped');
-const inputs = ['bitrate', 'minDelay', 'maxWait', 'nack', 'stun'];
+$('mute').onchange = () => { if (S.player) S.player.setMuted($('mute').checked); };
+const inputs = ['bitrate', 'minDelay', 'maxWait', 'nack', 'avsync', 'stun'];
 
 async function start() {
   if (!('VideoDecoder' in window)) {
@@ -75,8 +79,9 @@ async function start() {
     arrivals: [], prevArrivals: [], fbSeq: 0, fbIntervalMs: 50,
     pings: [], clock: null, pingId: 1,
     firstSeq: null, maxSeq: -1,
-    n: { packets: 0, bytes: 0, rtxPackets: 0, rendered: 0, decodeErrors: 0, freezes: 0, freezeMs: 0 },
-    win: { bytes: 0, rendered: 0, e2e: [], owd: [], decodeMs: [], at: now() },
+    n: { packets: 0, bytes: 0, audioPackets: 0, rtxPackets: 0, rendered: 0, decodeErrors: 0, freezes: 0, freezeMs: 0 },
+    win: { bytes: 0, audioBytes: 0, rendered: 0, e2e: [], offset: [], owd: [], decodeMs: [], at: now() },
+    ajb: null, player: null, audioWarned: false, avsync: $('avsync').checked,
     lastRenderAt: null, firstRenderMs: null,
   });
   const frameIntervalMs = 1000 / 30; // corrected when the server's hello arrives
@@ -85,10 +90,28 @@ async function start() {
     minDelayMs: Math.max(0, Number($('minDelay').value) || 0),
     maxWaitMs: Math.max(0, Number($('maxWait').value) || 0),
     nack: $('nack').checked,
-    sendNack: (items) => sendMedia(Wire.nack(items)),
+    sendNack: (items) => sendMedia(Wire.nack(Wire.VIDEO, items)),
     sendKeyRequest: (frameId) => { logEvent('keyframe request', `at frame ${frameId}`); sendMedia(Wire.keyRequest(frameId)); },
     rttMs: () => (S.clock ? S.clock.rttMs : 50),
   });
+  // The audio context has to be created here, inside the click.
+  if ('AudioDecoder' in window) {
+    try {
+      S.player = new AudioPlayer({ onError: (why) => logEvent('audio decoder error', why) });
+      S.player.setMuted($('mute').checked);
+      S.ajb = new AudioJitterBuffer({
+        minDelayMs: S.jb.o.minDelayMs,
+        nack: S.jb.o.nack,
+        sendNack: (items) => sendMedia(Wire.nack(Wire.AUDIO, items)),
+        rttMs: S.jb.o.rttMs,
+      });
+    } catch (e) {
+      logEvent('audio', `unavailable: ${e.message}`);
+      S.player = S.ajb = null;
+    }
+  } else {
+    logEvent('audio', 'unavailable: no AudioDecoder in this browser');
+  }
   setStatus('connecting…');
 
   const stun = $('stun').value.trim();
@@ -161,6 +184,7 @@ function stop(reason) {
   const pc = S.pc;
   S.pc = null;
   if (S.decoder && S.decoder.state !== 'closed') S.decoder.close();
+  if (S.player) S.player.close();
   // Let the last ctrl messages leave before the association goes away.
   setTimeout(() => pc.close(), 100);
   setStatus(`${reason}${S.logDir ? ` · server log ${S.logDir}` : ''}`);
@@ -176,7 +200,14 @@ function onCtrl(msg) {
     S.jb.o.frameIntervalMs = 1000 / msg.media.fps;
     canvas.width = msg.media.width;
     canvas.height = msg.media.height;
-    logEvent('hello', `${msg.media.width}x${msg.media.height} @ ${msg.media.fps.toFixed(2)} fps, controller ${msg.config.Controller}, ${msg.config.StartBitrate / 1000} kbps`);
+    const a = msg.audio || {};
+    if (!a.enabled && S.player) {
+      S.player.close();
+      S.player = S.ajb = null;
+    }
+    if (S.ajb) S.ajb.o.frameMs = S.player.o.frameMs = a.frameMs;
+    logEvent('hello', `${msg.media.width}x${msg.media.height} @ ${msg.media.fps.toFixed(2)} fps, controller ${msg.config.Controller}, ${msg.config.StartBitrate / 1000} kbps, ` +
+      (a.enabled ? `audio Opus ${a.bitrate / 1000} kbps` : 'no audio'));
   } else if (msg.type === 'server-stats') {
     S.server = msg.data;
   }
@@ -199,15 +230,30 @@ function onMedia(buf) {
   if (S.firstSeq === null) S.firstSeq = p.seq;
   S.maxSeq = Math.max(S.maxSeq, p.seq);
   if (S.clock) S.win.owd.push(tRecv + S.clock.offsetMs - p.sendMs);
-  S.jb.push(p, tRecv);
+  if (p.audio) {
+    S.n.audioPackets++;
+    S.win.audioBytes += p.size;
+    if (S.ajb) S.ajb.push(p, tRecv);
+  } else {
+    S.jb.push(p, tRecv);
+  }
   pump();
 }
 
-// pump runs on every arrival and every 5 ms: it lets the jitter buffer send
-// NACKs and decodes every frame whose playout time has come.
+// pump runs on every arrival and every 5 ms: it lets the jitter buffers send
+// NACKs and decodes everything whose playout time has come. For lip sync each
+// buffer is told the capture-to-playout offset the other wants, and both use
+// the larger.
 function pump() {
   if (!S.pc) return;
   const t = now();
+  if (S.ajb) {
+    S.ajb.o.leadMs = 15 + S.player.latencyMs();
+    if (S.avsync) S.ajb.syncOffsetMs = S.jb.ownOffsetMs();
+    S.ajb.tick(t);
+    for (let a = S.ajb.pop(t); a; a = S.ajb.pop(t)) S.player.play(a);
+    if (S.avsync) S.jb.syncOffsetMs = S.ajb.offsetMs();
+  }
   S.jb.tick(t);
   for (let f = S.jb.pop(t); f; f = S.jb.pop(t)) decode(f);
 }
@@ -298,6 +344,7 @@ function onDecoded(vf) {
   S.win.rendered++;
   S.win.decodeMs.push(t - f.releasedAt);
   if (S.clock) S.win.e2e.push(t + S.clock.offsetMs - f.captureMs);
+  S.win.offset.push(t - f.captureMs);
   if (S.firstRenderMs === null) {
     S.firstRenderMs = t - S.t0;
     logEvent('first frame', `${S.firstRenderMs.toFixed(0)} ms after Start`);
@@ -327,23 +374,41 @@ function report() {
   const w = S.win;
   const dt = (t - w.at) / 1000;
   if (dt <= 0) return;
-  S.win = { bytes: 0, rendered: 0, e2e: [], owd: [], decodeMs: [], at: t };
+  S.win = { bytes: 0, audioBytes: 0, rendered: 0, e2e: [], offset: [], owd: [], decodeMs: [], at: t };
   const jb = S.jb.stats();
+  // Audio: when each block is heard, on the same terms as video's capture → render.
+  let audio = null;
+  if (S.ajb) {
+    const { played, ...player } = S.player.stats();
+    const offset = avg(played.map(([captureMs, heardMs]) => heardMs - captureMs));
+    const videoOffset = avg(w.offset);
+    audio = {
+      recvBitrate: w.audioBytes * 8 / dt,
+      e2eMs: offset !== null && S.clock ? offset + S.clock.offsetMs : null,
+      // Positive: the picture is behind the sound.
+      videoBehindAudioMs: offset !== null && videoOffset !== null ? videoOffset - offset : null,
+      player, jitterBuffer: S.ajb.stats(),
+    };
+    if (player.state !== 'running' && !S.audioWarned) {
+      S.audioWarned = true;
+      logEvent('audio', `output is ${player.state}: the browser has not allowed playback (press Start by hand)`);
+    }
+  }
   const expected = S.firstSeq === null ? 0 : S.maxSeq - S.firstSeq + 1;
   const stats = {
     recvBitrate: w.bytes * 8 / dt, renderedFps: w.rendered / dt,
     e2eMs: avg(w.e2e), e2eMaxMs: maxOf(w.e2e), owdMs: avg(w.owd), owdMaxMs: maxOf(w.owd), decodeMs: avg(w.decodeMs),
     rttMs: S.lastRttMs, clockOffsetMs: S.clock && S.clock.offsetMs, clockRttMs: S.clock && S.clock.rttMs,
     packetsExpected: expected, lossPct: expected ? 100 * (1 - S.n.packets / expected) : 0,
-    firstRenderMs: S.firstRenderMs, ...S.n, jitterBuffer: jb,
+    firstRenderMs: S.firstRenderMs, ...S.n, jitterBuffer: jb, audio,
   };
   sendCtrl('stats', stats);
 
   const sv = S.server || {};
   const enc = sv.encoder || {};
   const k = (bps) => (bps === undefined || bps === null ? null : bps / 1000);
-  charts.bitrate.push(t, { target: k(sv.targetBitrate), sent: k(sv.sendBitrate), encoded: k(enc.bitrate), recv: k(stats.recvBitrate), rtx: k(sv.rtxBitrate) });
-  charts.delay.push(t, { e2e: stats.e2eMs, owd: stats.owdMs, jbTarget: jb.targetMs, jbHold: jb.holdMs, rtt: stats.rttMs });
+  charts.bitrate.push(t, { target: k(sv.targetBitrate), sent: k(sv.sendBitrate), encoded: k(enc.bitrate), recv: k(stats.recvBitrate), rtx: k(sv.rtxBitrate), audio: k(sv.audioBitrate) });
+  charts.delay.push(t, { e2e: stats.e2eMs, audioE2e: audio && audio.e2eMs, owd: stats.owdMs, jbTarget: jb.targetMs, jbHold: jb.holdMs, rtt: stats.rttMs });
   charts.frames.push(t, { rendered: stats.renderedFps, encodedFps: enc.fps });
   for (const c of Object.values(charts)) c.draw(t);
   $('tiles').innerHTML = tilesHTML([
@@ -363,6 +428,14 @@ function report() {
     ['freezes', S.n.freezes, `· ${fmtNum(S.n.freezeMs)} ms`],
     ['pacer queue', sv.queueMs, 'ms'],
     ['SCTP buffered', sv.sctpBufferedBytes, 'bytes'],
+    ...(audio ? [
+      ['audio capture → heard', audio.e2eMs, 'ms'],
+      ['video behind audio', audio.videoBehindAudioMs, 'ms'],
+      ['audio buffer target', audio.jitterBuffer.targetMs, 'ms'],
+      ['audio packets lost', audio.jitterBuffer.lost, `· ${audio.jitterBuffer.recovered} recovered`],
+      ['audio late starts', audio.player.lateStarts, `· ${audio.player.reanchors} re-anchors`],
+      ['audio level', audio.player.level * 100, '%'],
+    ] : []),
   ]);
   $('t-client').textContent = JSON.stringify(stats, null, 1);
   $('t-server').textContent = JSON.stringify(sv, null, 1);
