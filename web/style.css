@@ -14,7 +14,7 @@ button:disabled { opacity: .5; cursor: default; }
 .settings { position: relative; }
 .settings summary { cursor: pointer; padding: 5px 8px; }
 .settings label { display: block; margin: 6px 0; font-size: 13px; }
-.settings input[type=number], .settings input[type=text] { font: inherit; width: 100%; padding: 3px 6px; border: 1px solid var(--grid); border-radius: 4px; background: var(--bg); color: var(--fg); }
+.settings input[type=number], .settings input[type=text], .settings select { font: inherit; width: 100%; padding: 3px 6px; border: 1px solid var(--grid); border-radius: 4px; background: var(--bg); color: var(--fg); }
 .settings[open] { background: var(--card); border: 1px solid var(--grid); border-radius: 8px; padding: 4px 10px 10px; min-width: 320px; }
 .status { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
 main { display: grid; gap: 16px; padding: 16px; grid-template-columns: minmax(0, 1fr); }
@@ -36,3 +36,5 @@ pre { font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-spac
 #video { width: 100%; height: auto; max-height: 60vh; object-fit: contain; background: #000; border-radius: 8px; display: block; }
 
 label.inline { font-size: 13px; margin-left: 8px; }
+h1 a { color: var(--accent); }
+.note { color: var(--muted); font-size: 13px; margin: 10px 2px 0; }

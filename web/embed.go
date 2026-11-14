@@ -3,5 +3,5 @@ package web
 
 import "embed"
 
-//go:embed index.html app.js wire.js jitterbuffer.js audio.js chart.js style.css
+//go:embed index.html app.js wire.js jitterbuffer.js audio.js chart.js style.css copa.html copa.js
 var FS embed.FS

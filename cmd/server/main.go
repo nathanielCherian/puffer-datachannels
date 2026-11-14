@@ -18,11 +18,13 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 
+	"puffer-datachannels/internal/copa"
 	"puffer-datachannels/internal/media"
 	"puffer-datachannels/internal/ratecontrol"
 	"puffer-datachannels/internal/session"
@@ -65,7 +67,14 @@ func main() {
 		snapInt      = flag.Duration("snapshot-interval", 250*time.Millisecond, "server snapshot period (snapshots.jsonl and the page)")
 		logPackets   = flag.Bool("log-packets", true, "log every sent packet and every feedback to cc.jsonl")
 		logDir       = flag.String("log-dir", "logs", "root directory for per-session log directories")
-		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent viewers (each is one ffmpeg decode and one x264 encode)")
+		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent sessions (a viewer is one ffmpeg decode and one x264 encode)")
+
+		copaMode     = flag.String("copa-mode", "default", "copa page: default (δ fixed), auto (the paper's mode switching) or competitive")
+		copaDelta    = flag.Float64("copa-delta", 0.5, "copa page: δ in default mode; Copa keeps about 1/δ packets queued")
+		copaMaxRate  = flag.Int("copa-max-rate", 20_000_000, "copa page: the most a session may send (bps); the page can ask for less")
+		copaMaxDur   = flag.Duration("copa-max-duration", 10*time.Minute, "copa page: close a session after this long (0 = never)")
+		emulateRate  = flag.Int("emulate-rate", 0, "testing: a bottleneck of this many bps for everything the server sends, all sessions together")
+		emulateQueue = flag.Duration("emulate-queue", 200*time.Millisecond, "testing: the --emulate-rate bottleneck's drop-tail buffer, as time to drain it")
 	)
 	flag.VisitAll(func(f *flag.Flag) {
 		if v, ok := os.LookupEnv(envName(f.Name)); ok {
@@ -77,6 +86,9 @@ func main() {
 	flag.Parse()
 	if _, err := ratecontrol.New(*cc, ratecontrol.Config{}); err != nil {
 		log.Fatal(err)
+	}
+	if !copa.ValidMode(copa.Mode(*copaMode)) || *copaDelta < 0.01 || *copaDelta > 2 || *copaMaxRate < *minBitrate {
+		log.Fatal("--copa-mode must be default, auto or competitive, --copa-delta within 0.01..2, --copa-max-rate at least --min-bitrate")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -101,14 +113,17 @@ func main() {
 			log.Fatalf("listen udp %d: %v", *udpPort, err)
 		}
 		var conn net.PacketConn = udp
-		if *emulateLoss > 0 || *emulateDelay > 0 {
-			conn = newImpairedConn(udp, *emulateLoss, *emulateDelay)
+		if *emulateLoss > 0 || *emulateDelay > 0 || *emulateRate > 0 {
+			conn = newImpairedConn(udp, *emulateLoss, *emulateDelay, *emulateRate, *emulateQueue)
 			log.Printf("TESTING: outgoing packets delayed %v, %.1f%% of media packets dropped", *emulateDelay, *emulateLoss*100)
+			if *emulateRate > 0 {
+				log.Printf("TESTING: outgoing packets through a %d bps bottleneck with a %v buffer", *emulateRate, *emulateQueue)
+			}
 		}
 		se.SetICEUDPMux(webrtc.NewICEUDPMux(nil, conn))
 		log.Printf("WebRTC on UDP port %d", *udpPort)
-	} else if *emulateLoss > 0 || *emulateDelay > 0 {
-		log.Fatal("--emulate-loss and --emulate-delay need --udp-port")
+	} else if *emulateLoss > 0 || *emulateDelay > 0 || *emulateRate > 0 {
+		log.Fatal("--emulate-loss, --emulate-delay and --emulate-rate need --udp-port")
 	}
 	if *publicIP != "" {
 		if err := se.SetICEAddressRewriteRules(webrtc.ICEAddressRewriteRule{
@@ -130,12 +145,14 @@ func main() {
 		X264Preset: *preset, X264Threads: *threads, MaxQueue: *maxQueue, History: *history,
 		FeedbackInterval: *fbInterval, SnapshotInterval: *snapInt, LogPackets: *logPackets,
 		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions, ICEServers: iceServers,
+		CopaMode: *copaMode, CopaDelta: *copaDelta, CopaMaxRate: *copaMaxRate, CopaMaxDuration: *copaMaxDur,
 	}
 	hostname, _ := os.Hostname()
 	mgr := session.NewManager(cfg, info, se, map[string]any{
 		"hostname": hostname, "numCPU": runtime.NumCPU(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 		"goVersion": runtime.Version(), "x264Build": x264.Build(), "udpPort": *udpPort,
 		"sctpMinCwnd": *sctpMinCwnd, "emulateLoss": *emulateLoss, "emulateDelayMs": emulateDelay.Milliseconds(),
+		"emulateRate": *emulateRate, "emulateQueueMs": emulateQueue.Milliseconds(),
 	})
 
 	mux := http.NewServeMux()
@@ -151,17 +168,17 @@ func main() {
 			return
 		}
 		resp, err := mgr.HandleOffer(r.Context(), req, r.RemoteAddr)
-		switch {
-		case errors.Is(err, session.ErrTooManySessions):
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
-		case errors.Is(err, session.ErrBadOffer):
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		case err != nil:
-			log.Printf("offer from %s: %v", r.RemoteAddr, err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		default:
-			writeJSON(w, http.StatusOK, resp)
+		writeOfferResponse(w, r, resp, err)
+	})
+	// The Copa page (web/copa.html): junk data under Copa's control.
+	mux.HandleFunc("POST /copa/offer", func(w http.ResponseWriter, r *http.Request) {
+		var req session.CopaRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid offer"})
+			return
 		}
+		resp, err := mgr.HandleCopaOffer(r.Context(), req, r.RemoteAddr)
+		writeOfferResponse(w, r, resp, err)
 	})
 
 	srv := &http.Server{Addr: *httpAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -184,15 +201,41 @@ func main() {
 	}
 }
 
-// impairedConn stands in for a bad downlink when there is no tc/netem. It
-// drops a fraction of the large packets the server sends, which in practice
-// means media (ICE checks, the DTLS handshake, SACKs and pongs are smaller),
-// and holds every outgoing packet for a fixed time, in order.
+func writeOfferResponse(w http.ResponseWriter, r *http.Request, resp *session.OfferResponse, err error) {
+	switch {
+	case errors.Is(err, session.ErrTooManySessions):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+	case errors.Is(err, session.ErrBadOffer):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case err != nil:
+		log.Printf("offer from %s: %v", r.RemoteAddr, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// impairedConn stands in for a bad downlink when there is no tc/netem. In
+// the order a packet meets them:
+//
+//   - loss: a fraction of the large packets the server sends are dropped,
+//     which in practice means media (ICE checks, the DTLS handshake, SACKs and
+//     pongs are smaller);
+//   - rate: a bottleneck link. Packets are sent one after another, each taking
+//     its size at the link's rate, and wait their turn in a drop-tail buffer
+//     that holds queueLimit's worth. The link is shared by every session, so
+//     two pages compete for it;
+//   - delay: every packet is then held for a fixed time, in order.
 type impairedConn struct {
 	net.PacketConn
-	loss  float64
-	delay time.Duration
-	queue chan delayedPacket
+	loss       float64
+	delay      time.Duration
+	rate       float64 // bytes per second; 0 = no bottleneck
+	queueLimit time.Duration
+	queue      chan delayedPacket
+
+	mu       sync.Mutex
+	linkFree time.Time // when the bottleneck finishes what it has accepted
 }
 
 type delayedPacket struct {
@@ -201,9 +244,10 @@ type delayedPacket struct {
 	due  time.Time
 }
 
-func newImpairedConn(c net.PacketConn, loss float64, delay time.Duration) *impairedConn {
-	ic := &impairedConn{PacketConn: c, loss: loss, delay: delay, queue: make(chan delayedPacket, 1<<16)}
-	if delay > 0 {
+func newImpairedConn(c net.PacketConn, loss float64, delay time.Duration, rateBps int, queueLimit time.Duration) *impairedConn {
+	ic := &impairedConn{PacketConn: c, loss: loss, delay: delay, rate: float64(rateBps) / 8, queueLimit: queueLimit,
+		queue: make(chan delayedPacket, 1<<16)}
+	if delay > 0 || ic.rate > 0 {
 		go func() {
 			for p := range ic.queue {
 				time.Sleep(time.Until(p.due))
@@ -218,11 +262,26 @@ func (c *impairedConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if len(b) > 300 && rand.Float64() < c.loss {
 		return len(b), nil
 	}
-	if c.delay == 0 {
+	if c.delay == 0 && c.rate == 0 {
 		return c.PacketConn.WriteTo(b, addr)
 	}
+	// The lock is held across the enqueue so that packets enter the channel in
+	// the order of their due times.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	due := time.Now()
+	if c.rate > 0 {
+		if c.linkFree.Before(due) {
+			c.linkFree = due
+		}
+		if c.linkFree.Sub(due) > c.queueLimit {
+			return len(b), nil // buffer full
+		}
+		c.linkFree = c.linkFree.Add(time.Duration(float64(len(b)) / c.rate * float64(time.Second)))
+		due = c.linkFree
+	}
 	select {
-	case c.queue <- delayedPacket{append([]byte(nil), b...), addr, time.Now().Add(c.delay)}:
+	case c.queue <- delayedPacket{append([]byte(nil), b...), addr, due.Add(c.delay)}:
 	default: // queue full: drop
 	}
 	return len(b), nil

@@ -45,6 +45,9 @@ also be set as `PUFFER_<FLAG>`.
 | `--feedback-interval` | 50ms | how often the browser reports arrivals |
 | `--sctp-min-cwnd` | 64 MiB | floor for SCTP's congestion window; 0 leaves SCTP congestion control on |
 | `--emulate-loss`, `--emulate-delay` | 0 | testing: drop a fraction of outgoing media packets / hold every outgoing packet |
+| `--emulate-rate`, `--emulate-queue` | 0, 200ms | testing: a bottleneck of this many bps for everything the server sends, with a drop-tail buffer this long |
+| `--copa-mode`, `--copa-delta` | `default`, 0.5 | the Copa page: how δ is chosen, and δ |
+| `--copa-max-rate`, `--copa-max-duration` | 20000000, 10m | the Copa page: the most a session may send, and for how long |
 
 ## SCTP
 
@@ -99,6 +102,86 @@ old). Arrival times are on the browser's clock: use differences. Audio packets
 (`SentPacket.Audio`) share the sequence numbers and the pacer, and leave ahead
 of video.
 
+## Copa
+
+`/copa.html` is the transport without the media: the server sends random
+bytes as fast as [Copa](https://www.usenix.org/conference/nsdi18/presentation/arun)
+(Arun and Balakrishnan, NSDI 2018) allows, and the page acknowledges and
+measures them. Same `media` channel, same DATA format, same SCTP settings as
+above; no ffmpeg, no encoder, no retransmission.
+
+```sh
+./bin/server --emulate-rate 5000000 --emulate-delay 20ms   # a 5 Mbps, 20 ms link to converge on
+# http://localhost:8080/copa.html, press Start
+```
+
+Without `--emulate-rate` (or a real bottleneck) there is nothing on localhost
+for Copa to find, and it sends at `--copa-max-rate`.
+
+**The algorithm** is `internal/copa`: no clock, no I/O, one call per ack. It
+is §2 of the paper: RTTmin over 10 s and RTTstanding over srtt/2, queueing
+delay `dq` their difference, target rate `1/(δ·dq)`, cwnd moved by
+`v/(δ·cwnd)` per ack towards it, the velocity `v` doubling after three RTTs in
+one direction, slow start until the rate first exceeds the target, pacing at
+`2·cwnd/RTTstanding`, and no reaction to loss in default mode. Two additions
+are marked in the code: `v` resets as soon as an ack decides against the
+current direction, and `v` is bounded so that one RTT cannot more than double
+cwnd. `MaxRate` (the page's rate cap) is not Copa: it caps the pacing rate and
+stops cwnd growing past what that rate can keep in flight.
+
+**The sender** is `internal/session/copa.go`. A packet leaves when fewer than
+cwnd are unacknowledged and the pacer's budget allows. A packet is lost once
+three later ones are acknowledged, or after max(1 s, 4 srtt); if nothing at
+all was acknowledged in that time Copa restarts from slow start.
+
+**Acks.** The page acknowledges each packet as it arrives (media reports every
+50 ms; Copa needs the ack clock and an RTT per packet). An ack is a FEEDBACK
+message naming the last four arrivals with their arrival times, so a lost ack
+is covered by the next three, and the RTT is exact either way: ack arrival −
+packet send time − how long the page held it.
+
+**What the page measures** (`web/copa.js`), from the packets alone, every
+200 ms and over the whole run: received rate; loss (missing sequence numbers);
+late (reordered) and duplicate packets; one-way delay (needs the clock offset
+from pings, so it is off by half the path's asymmetry); queueing delay (transit
+time above the lowest seen, which needs no clock offset) with p50/p95/p99;
+RFC 3550 jitter; the longest gap between arrivals. Beside these it shows the
+sender's state from its 100 ms snapshots: cwnd, packets in flight, RTTmin,
+RTTstanding, δ, velocity, mode, target and pacing rates. Each interval is a
+row in "Download metrics (CSV)" and a `stats` line in the session's
+`client.jsonl`; `cc.jsonl` has every packet (`sent`, `ack` with its RTT,
+`lost`).
+
+Measured in Chrome on localhost with `--emulate-rate 5000000 --emulate-delay
+20ms` (1150-byte messages are about 1.84 ms each on that link, which carries
+about 4.2 Mbps of them once SCTP and DTLS headers, SACKs and the stats channel
+are paid for):
+
+| | received | queueing delay p50 / p95 / p99 | lost |
+|---|---|---|---|
+| default mode, 30 s | 4.20 Mbps | 5.3 / 9.8 / 11.3 ms | 0 |
+| default mode, `--emulate-loss 0.01`, 24 s | 4.21 Mbps | 5.3 / 9.8 / 11.3 ms | 1.1% |
+| two default-mode flows, 20 s | 1.90 and 1.85 Mbps | 8.8–10.3 / 16.8 ms | 0 |
+| rate cap 2 Mbps, 10 s | 2.00 Mbps | 0.3 / 0.8 / 1.8 ms | 0 |
+| competitive mode, 14 s | 4.13 Mbps | 147 / 196 / 199 ms | 0.3% |
+| auto mode, 24 s | 4.14 Mbps | 157 / 195 / 198 ms | 0.2% |
+
+5.3 ms is 2.9 packets, against the 2.5 (1.25/δ) the paper derives.
+
+**Modes.** `default` keeps δ at 0.5. `competitive` runs AIMD on 1/δ (plus one
+per RTT, halved on loss) so that Copa holds a share against a buffer-filling
+flow: in the simulator in `internal/copa/copa_test.go`, default mode gets 7%
+of a link shared with one AIMD flow and mode switching gets 44%. `auto` is the
+paper's switching between the two (§2.2), implemented as written, and it is
+not the default because, as written, it misfires with nothing but Copa on the
+link: the last row of the table is a lone flow that turned competitive 0.8 s
+in and stayed there. A Copa cycle bottoms out at exactly an empty queue with
+no margin, so where delay comes in whole packets some cycles stop one packet
+short of what the detector calls "nearly empty"; and once competitive, with
+1/δ large next to the path's BDP, cwnd settles instead of oscillating, the
+queue stops emptying, and only loss brings δ back. The note on `updateMode`
+has the detail.
+
 ## Writing a jitter buffer
 
 `web/jitterbuffer.js` is one class with `push(packet, now)`, `tick(now)`,
@@ -148,7 +231,7 @@ One directory per session; every line is `{"t": <server unix ms>, "kind", "data"
 |---|---|
 | `meta.json` | config, media, client info, SDP |
 | `events.jsonl` | state changes, keyframe requests, dropped frames |
-| `cc.jsonl` | `sent` (every packet) and `feedback` (per-packet results, RTT, rates afterwards); `--log-packets=false` turns it off |
+| `cc.jsonl` | `sent` (every packet) and `feedback` (per-packet results, RTT, rates afterwards); `--log-packets=false` turns it off. A Copa session has `sent`, `ack` and `lost` instead |
 | `encoder.jsonl` | every frame (size, keyframe, encode time, whether it was queued), reconfigurations |
 | `snapshots.jsonl` | every 250 ms: counters, pacer queue, rates, encoder, audio, SCTP backlog |
 | `client.jsonl` | the page's stats (every 500 ms) and events |
@@ -162,3 +245,8 @@ One directory per session; every line is `{"t": <server unix ms>, "kind", "data"
   (clock offset from the lowest-RTT ping).
 - Each viewer costs one ffmpeg decode, one Opus encode and one x264 encode.
 - A source without an audio stream plays video only.
+- `--emulate-rate` shapes only what the server sends, and all of it: data,
+  SACKs for the page's acks, pongs and the stats channel share the link.
+- Copa's RTT samples include the page's main thread: an ack waits for the
+  message event to be dispatched. RTTstanding (a minimum) absorbs most of it;
+  a busy or throttled tab still reads as queueing delay.

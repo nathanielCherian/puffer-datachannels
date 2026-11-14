@@ -50,6 +50,12 @@ type Config struct {
 	ConnectTimeout                       time.Duration
 	MaxSessions                          int
 	ICEServers                           []webrtc.ICEServer `json:"-"`
+
+	// The Copa page (copa.go).
+	CopaMode        string        // default, auto or competitive
+	CopaDelta       float64       // δ in default mode
+	CopaMaxRate     int           // bps: the most a Copa session may send
+	CopaMaxDuration time.Duration // a Copa session is closed after this long; 0 = never
 }
 
 // Settings applies what this design needs from pion to a SettingEngine.
@@ -85,11 +91,13 @@ type Manager struct {
 	host     map[string]any
 
 	mu       sync.Mutex
-	sessions map[string]*Session
+	sessions map[string]closer // media and Copa sessions alike
 }
 
+type closer interface{ Close(reason string) }
+
 func NewManager(cfg Config, info *mediasrc.Info, settings webrtc.SettingEngine, host map[string]any) *Manager {
-	return &Manager{cfg: cfg, info: info, settings: settings, host: host, sessions: map[string]*Session{}}
+	return &Manager{cfg: cfg, info: info, settings: settings, host: host, sessions: map[string]closer{}}
 }
 
 func (m *Manager) ActiveSessions() int {
@@ -100,7 +108,7 @@ func (m *Manager) ActiveSessions() int {
 
 func (m *Manager) CloseAll() {
 	m.mu.Lock()
-	all := make([]*Session, 0, len(m.sessions))
+	all := make([]closer, 0, len(m.sessions))
 	for _, s := range m.sessions {
 		all = append(all, s)
 	}
@@ -108,6 +116,12 @@ func (m *Manager) CloseAll() {
 	for _, s := range all {
 		s.Close("server shutting down")
 	}
+}
+
+func (m *Manager) full() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.MaxSessions > 0 && len(m.sessions) >= m.cfg.MaxSessions
 }
 
 // OfferRequest is the body of POST /offer.
@@ -182,10 +196,7 @@ func newID() string {
 // HandleOffer creates a session from a browser offer and returns the answer
 // (with all ICE candidates included; no trickle).
 func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr string) (*OfferResponse, error) {
-	m.mu.Lock()
-	full := m.cfg.MaxSessions > 0 && len(m.sessions) >= m.cfg.MaxSessions
-	m.mu.Unlock()
-	if full {
+	if m.full() {
 		return nil, ErrTooManySessions
 	}
 	if req.SDP == "" {
@@ -296,7 +307,13 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 		}
 	})
 
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: req.SDP}); err != nil {
+	return negotiate(ctx, pc, req.SDP)
+}
+
+// negotiate answers the browser's offer and waits for ICE gathering, so that
+// the answer carries every candidate (no trickle).
+func negotiate(ctx context.Context, pc *webrtc.PeerConnection, offer string) error {
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}); err != nil {
 		return fmt.Errorf("%w: %v", ErrBadOffer, err)
 	}
 	answer, err := pc.CreateAnswer(nil)
