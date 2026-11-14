@@ -13,19 +13,21 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"puffer-datachannels/internal/copa"
+	"puffer-datachannels/internal/cubic"
 	"puffer-datachannels/internal/logs"
 	"puffer-datachannels/internal/wire"
 )
 
-// A Copa session is the transport on its own: no ffmpeg, no encoder, no
-// retransmission. The server always has data (junk) to send, and Copa
-// (internal/copa) decides how much of it goes out. The channel and the DATA
-// format are the ones media uses, so everything said about SCTP in Settings
-// holds here too; the differences are on the return path:
+// A congestion-control (cc) session is the transport on its own: no ffmpeg,
+// no encoder, no retransmission. The server always has data (junk) to send,
+// and a congestion controller, Copa (internal/copa) or CUBIC (internal/cubic),
+// decides how much of it goes out. The channel and the DATA format are the
+// ones media uses, so everything said about SCTP in Settings holds here too;
+// the differences are on the return path:
 //
 //   - The browser acknowledges every packet the moment it arrives, instead of
-//     reporting every 50 ms. Copa is clocked by acks: a packet may only leave
-//     when one comes back, and each ack is an RTT sample.
+//     reporting every 50 ms. Both controllers are clocked by acks: a packet
+//     may only leave when one comes back, and each ack is an RTT sample.
 //   - An ack is a FEEDBACK message naming the last few arrivals, the newest
 //     last, so a lost ack is covered by the next ones. An arrival's RTT is
 //     ack arrival - packet send time - how long the browser held it, which is
@@ -33,35 +35,60 @@ import (
 //
 // Nothing is ever retransmitted: a lost packet is counted and forgotten.
 
-// CopaRequest is the body of POST /copa/offer. Zero fields take the server's
-// values (--copa-max-rate, --copa-mode, --copa-delta, --copa-max-duration).
-type CopaRequest struct {
+// controller is what the sender needs from a congestion controller. Windows
+// are in packets and rates in packets per second. The sender calls it with
+// its lock held.
+type controller interface {
+	// OnAck: one packet was acknowledged at now; it left at sentAt, when Cwnd
+	// was cwndAtSend, and measured rtt.
+	OnAck(now, sentAt time.Time, rtt time.Duration, cwndAtSend float64)
+	// OnLoss: one packet, sent at sentAt, was given up on at now.
+	OnLoss(now, sentAt time.Time)
+	// OnTimeout: nothing at all was acknowledged for a timeout.
+	OnTimeout()
+	Cwnd() float64
+	PacingRate() float64
+	SRTT() time.Duration
+}
+
+// Algorithms lists the congestion controllers a session can run.
+func Algorithms() []string { return []string{"copa", "cubic"} }
+
+// ValidAlgorithm reports whether name is one of Algorithms.
+func ValidAlgorithm(name string) bool { return name == "copa" || name == "cubic" }
+
+// CCRequest is the body of POST /cc/offer. Zero fields take the server's
+// values (--cc-algorithm, --cc-max-rate, --cc-max-duration, --copa-mode,
+// --copa-delta).
+type CCRequest struct {
 	SDP         string          `json:"sdp"`
 	Type        string          `json:"type"`
+	Algorithm   string          `json:"algorithm,omitempty"`   // copa, cubic
 	MaxRate     int             `json:"maxRate,omitempty"`     // bps of DataChannel messages; at most the server's
-	Mode        string          `json:"mode,omitempty"`        // default, auto, competitive
-	Delta       float64         `json:"delta,omitempty"`       // δ in default mode
+	Mode        string          `json:"mode,omitempty"`        // Copa: default, auto, competitive
+	Delta       float64         `json:"delta,omitempty"`       // Copa: δ in default mode
 	DurationSec float64         `json:"durationSec,omitempty"` // stop by itself after this long; at most the server's
 	Client      json.RawMessage `json:"client,omitempty"`
 }
 
-// copaParams is what one session runs with, after the request has been
+// ccParams is what one session runs with, after the request has been
 // checked against the server's limits.
-type copaParams struct {
-	Mode        copa.Mode     `json:"mode"`
-	Delta       float64       `json:"delta"`
+type ccParams struct {
+	Algorithm   string        `json:"algorithm"`
+	Mode        copa.Mode     `json:"mode"`        // Copa only
+	Delta       float64       `json:"delta"`       // Copa only
 	MaxRate     int           `json:"maxRate"`     // bps of DataChannel messages
 	Duration    time.Duration `json:"-"`           // 0 = until the page stops
 	DurationSec float64       `json:"durationSec"` // the same, for JSON
 	PacketBytes int           `json:"packetBytes"`
 }
 
-// CopaSession is one browser receiving junk under Copa's control.
-type CopaSession struct {
+// CCSession is one browser receiving junk under a congestion controller.
+type CCSession struct {
 	id      string
 	mgr     *Manager
 	cfg     Config
-	params  copaParams
+	params  ccParams
 	created time.Time
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -75,16 +102,22 @@ type CopaSession struct {
 	closeOnce sync.Once
 }
 
-// HandleCopaOffer creates a Copa session from a browser offer.
-func (m *Manager) HandleCopaOffer(ctx context.Context, req CopaRequest, remoteAddr string) (*OfferResponse, error) {
+// HandleCCOffer creates a congestion-control session from a browser offer.
+func (m *Manager) HandleCCOffer(ctx context.Context, req CCRequest, remoteAddr string) (*OfferResponse, error) {
 	if m.full() {
 		return nil, ErrTooManySessions
 	}
 	if req.SDP == "" {
 		return nil, fmt.Errorf("%w: empty sdp", ErrBadOffer)
 	}
-	p := copaParams{Mode: copa.Mode(m.cfg.CopaMode), Delta: m.cfg.CopaDelta, MaxRate: m.cfg.CopaMaxRate,
-		Duration: m.cfg.CopaMaxDuration, PacketBytes: wire.MaxMessage}
+	p := ccParams{Algorithm: m.cfg.CCAlgorithm, Mode: copa.Mode(m.cfg.CopaMode), Delta: m.cfg.CopaDelta, MaxRate: m.cfg.CCMaxRate,
+		Duration: m.cfg.CCMaxDuration, PacketBytes: wire.MaxMessage}
+	if req.Algorithm != "" {
+		if !ValidAlgorithm(req.Algorithm) {
+			return nil, fmt.Errorf("%w: algorithm must be one of %v", ErrBadOffer, Algorithms())
+		}
+		p.Algorithm = req.Algorithm
+	}
 	if req.Mode != "" {
 		if !copa.ValidMode(copa.Mode(req.Mode)) {
 			return nil, fmt.Errorf("%w: mode must be default, auto or competitive", ErrBadOffer)
@@ -98,27 +131,27 @@ func (m *Manager) HandleCopaOffer(ctx context.Context, req CopaRequest, remoteAd
 		p.Delta = req.Delta
 	}
 	if req.MaxRate != 0 {
-		if req.MaxRate < m.cfg.MinBitrate || req.MaxRate > m.cfg.CopaMaxRate {
-			return nil, fmt.Errorf("%w: maxRate must be within %d..%d bps", ErrBadOffer, m.cfg.MinBitrate, m.cfg.CopaMaxRate)
+		if req.MaxRate < m.cfg.MinBitrate || req.MaxRate > m.cfg.CCMaxRate {
+			return nil, fmt.Errorf("%w: maxRate must be within %d..%d bps", ErrBadOffer, m.cfg.MinBitrate, m.cfg.CCMaxRate)
 		}
 		p.MaxRate = req.MaxRate
 	}
 	if req.DurationSec != 0 {
 		d := time.Duration(req.DurationSec * float64(time.Second))
-		if d <= 0 || (m.cfg.CopaMaxDuration > 0 && d > m.cfg.CopaMaxDuration) {
-			return nil, fmt.Errorf("%w: durationSec must be positive and at most %v", ErrBadOffer, m.cfg.CopaMaxDuration)
+		if d <= 0 || (m.cfg.CCMaxDuration > 0 && d > m.cfg.CCMaxDuration) {
+			return nil, fmt.Errorf("%w: durationSec must be positive and at most %v", ErrBadOffer, m.cfg.CCMaxDuration)
 		}
 		p.Duration = d
 	}
 	p.DurationSec = p.Duration.Seconds()
 
-	s := &CopaSession{id: newID(), mgr: m, cfg: m.cfg, params: p, created: time.Now()}
+	s := &CCSession{id: newID(), mgr: m, cfg: m.cfg, params: p, created: time.Now()}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	var err error
 	if s.log, err = logs.NewSession(m.cfg.LogDir, s.id); err != nil {
 		return nil, fmt.Errorf("create log: %w", err)
 	}
-	s.event("session", "created (copa)")
+	s.event("session", "created (cc: "+p.Algorithm+")")
 	if err := s.setup(ctx, req); err != nil {
 		s.Close("setup failed: " + err.Error())
 		return nil, err
@@ -139,21 +172,21 @@ func (m *Manager) HandleCopaOffer(ctx context.Context, req CopaRequest, remoteAd
 
 	ld := s.pc.LocalDescription()
 	_ = s.log.WriteMeta(map[string]any{
-		"kind": "copa", "sessionId": s.id, "createdAt": s.created.UTC().Format(time.RFC3339Nano), "createdMs": logs.Ms(s.created),
-		"remoteAddr": remoteAddr, "client": req.Client, "copa": p, "config": m.cfg, "host": m.host,
+		"kind": "cc", "sessionId": s.id, "createdAt": s.created.UTC().Format(time.RFC3339Nano), "createdMs": logs.Ms(s.created),
+		"remoteAddr": remoteAddr, "client": req.Client, "cc": p, "config": m.cfg, "host": m.host,
 		"offer": req.SDP, "answer": ld.SDP,
 		"files": map[string]string{
 			"events.jsonl":    "server state changes (pc/ice states, channels, start, close)",
 			"cc.jsonl":        "every packet: sent (seq, cwnd when it left), ack (seq, rttMs, the browser's receive time, cwnd afterwards) and lost (seq, whether by timeout)",
-			"snapshots.jsonl": "periodic server snapshot: counters, packets in flight, send and delivery rates, Copa's state",
+			"snapshots.jsonl": "periodic server snapshot: counters, packets in flight, send and delivery rates, the controller's state (under its name)",
 			"client.jsonl":    "what the page measured and reported over the ctrl channel (t = server receive time)",
 		},
 	})
-	log.Printf("[%s] new copa session from %s: mode %s, δ %g, at most %d bps (log: %s)", s.id, remoteAddr, p.Mode, p.Delta, p.MaxRate, s.log.Dir)
+	log.Printf("[%s] new cc session from %s: %s, at most %d bps (log: %s)", s.id, remoteAddr, p.Algorithm, p.MaxRate, s.log.Dir)
 	return &OfferResponse{SDP: ld.SDP, Type: ld.Type.String(), SessionID: s.id, LogDir: s.log.Dir}, nil
 }
 
-func (s *CopaSession) setup(ctx context.Context, req CopaRequest) error {
+func (s *CCSession) setup(ctx context.Context, req CCRequest) error {
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(s.mgr.settings))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: s.cfg.ICEServers})
 	if err != nil {
@@ -189,7 +222,7 @@ func (s *CopaSession) setup(ctx context.Context, req CopaRequest) error {
 				s.event("dataChannel", "ctrl open")
 				s.sendCtrl(map[string]any{
 					"type": "hello", "sessionId": s.id, "serverTimeMs": logs.NowMs(), "logDir": s.log.Dir,
-					"copa": s.params, "snapshotIntervalMs": ms(s.snapshotInterval()),
+					"cc": s.params, "snapshotIntervalMs": ms(s.snapshotInterval()),
 				})
 			})
 			dc.OnMessage(func(msg webrtc.DataChannelMessage) { s.onCtrlMessage(msg.Data) })
@@ -200,7 +233,7 @@ func (s *CopaSession) setup(ctx context.Context, req CopaRequest) error {
 	return negotiate(ctx, pc, req.SDP)
 }
 
-func (s *CopaSession) onMediaMessage(dc *webrtc.DataChannel, b []byte) {
+func (s *CCSession) onMediaMessage(dc *webrtc.DataChannel, b []byte) {
 	now := time.Now()
 	if len(b) == 0 {
 		return
@@ -217,7 +250,7 @@ func (s *CopaSession) onMediaMessage(dc *webrtc.DataChannel, b []byte) {
 	}
 }
 
-func (s *CopaSession) onCtrlMessage(b []byte) {
+func (s *CCSession) onCtrlMessage(b []byte) {
 	var rec struct {
 		Type string          `json:"type"`
 		Data json.RawMessage `json:"data"`
@@ -230,18 +263,22 @@ func (s *CopaSession) onCtrlMessage(b []byte) {
 
 // snapshotInterval is shorter than media's: a Copa cycle is five RTTs, and a
 // quarter-second sample would show none of it.
-func (s *CopaSession) snapshotInterval() time.Duration {
+func (s *CCSession) snapshotInterval() time.Duration {
 	return min(s.cfg.SnapshotInterval, 100*time.Millisecond)
 }
 
-func (s *CopaSession) run(dc *webrtc.DataChannel) {
-	cc := copa.New(copa.Config{
-		Delta: s.params.Delta, Mode: s.params.Mode,
-		MaxRate: float64(s.params.MaxRate) / 8 / float64(s.params.PacketBytes),
-	})
+func (s *CCSession) run(dc *webrtc.DataChannel) {
+	maxRate := float64(s.params.MaxRate) / 8 / float64(s.params.PacketBytes) // packets per second
+	var cc controller
+	switch s.params.Algorithm {
+	case "cubic":
+		cc = cubic.New(cubic.Config{MaxRate: maxRate})
+	default:
+		cc = copa.New(copa.Config{Delta: s.params.Delta, Mode: s.params.Mode, MaxRate: maxRate})
+	}
 	snd := newJunkSender(dc.Send, cc, s.cfg.LogPackets, func(kind string, t time.Time, data any) { s.log.LogAt("cc", t, kind, data) })
 	s.snd.Store(snd)
-	s.event("copa", "started")
+	s.event("cc", s.params.Algorithm+" started")
 	if s.params.Duration > 0 {
 		go func() {
 			select {
@@ -255,7 +292,7 @@ func (s *CopaSession) run(dc *webrtc.DataChannel) {
 	go s.snapshotLoop(dc, snd)
 }
 
-func (s *CopaSession) snapshotLoop(dc *webrtc.DataChannel, snd *junkSender) {
+func (s *CCSession) snapshotLoop(dc *webrtc.DataChannel, snd *junkSender) {
 	t := time.NewTicker(s.snapshotInterval())
 	defer t.Stop()
 	var prev junkCounters
@@ -277,7 +314,7 @@ func (s *CopaSession) snapshotLoop(dc *webrtc.DataChannel, snd *junkSender) {
 		prev, prevT = c, now
 		// See the media snapshot: with SCTP's congestion control out of the way
 		// this is about one RTT of data. Growth means SCTP is holding packets
-		// back and the RTTs Copa sees include that wait.
+		// back and the RTTs the controller sees include that wait.
 		snap["sctpBufferedBytes"] = dc.BufferedAmount()
 		snap["uptimeSec"] = now.Sub(s.created).Seconds()
 		s.log.Log("snapshots", "snapshot", snap)
@@ -285,7 +322,7 @@ func (s *CopaSession) snapshotLoop(dc *webrtc.DataChannel, snd *junkSender) {
 	}
 }
 
-func (s *CopaSession) sendCtrl(v any) {
+func (s *CCSession) sendCtrl(v any) {
 	dc := s.ctrlDC.Load()
 	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		return
@@ -295,10 +332,10 @@ func (s *CopaSession) sendCtrl(v any) {
 	}
 }
 
-func (s *CopaSession) event(kind string, value any) { s.log.Log("events", kind, value) }
+func (s *CCSession) event(kind string, value any) { s.log.Log("events", kind, value) }
 
 // Close ends the session (idempotent).
-func (s *CopaSession) Close(reason string) {
+func (s *CCSession) Close(reason string) {
 	s.closeOnce.Do(func() {
 		log.Printf("[%s] closed: %s", s.id, reason)
 		s.event("closed", reason)
@@ -316,10 +353,10 @@ func (s *CopaSession) Close(reason string) {
 }
 
 // junkSender is a sender that always has something to send. A packet leaves
-// when there is room in Copa's window and the pacer's budget allows it.
+// when there is room in the controller's window and the pacer's budget allows.
 type junkSender struct {
 	write   func([]byte) error // DataChannel.Send
-	cc      *copa.Copa
+	cc      controller
 	logf    func(kind string, t time.Time, data any)
 	logPkts bool
 	junk    []byte // every packet's payload
@@ -337,7 +374,7 @@ type junkSender struct {
 
 type junkPacket struct {
 	at   time.Time
-	cwnd float64 // Copa's window when it left
+	cwnd float64 // the window when it left
 }
 
 type junkCounters struct {
@@ -358,7 +395,7 @@ const (
 	junkMinRTO = time.Second
 )
 
-func newJunkSender(write func([]byte) error, cc *copa.Copa, logPkts bool, logf func(string, time.Time, any)) *junkSender {
+func newJunkSender(write func([]byte) error, cc controller, logPkts bool, logf func(string, time.Time, any)) *junkSender {
 	junk := make([]byte, wire.MaxPayload)
 	_, _ = rand.Read(junk)
 	return &junkSender{write: write, cc: cc, logf: logf, logPkts: logPkts, junk: junk,
@@ -373,7 +410,7 @@ func (s *junkSender) kick() {
 }
 
 // run is the send loop. The pacer is the media sender's: a byte budget that
-// refills at Copa's pacing rate, may go one packet negative, and saves up at
+// refills at the controller's pacing rate, may go one packet negative, and saves up at
 // most a couple of milliseconds. On top of it sits the window: nothing leaves
 // while cwnd packets are unacknowledged, and an ack wakes the loop.
 func (s *junkSender) run(ctx context.Context) {
@@ -435,8 +472,8 @@ func (s *junkSender) sendLocked(now time.Time) {
 	}
 }
 
-// onFeedback handles one ack message: an RTT sample to Copa for every packet
-// it acknowledges for the first time.
+// onFeedback handles one ack message: an RTT sample to the controller for
+// every packet it acknowledges for the first time.
 func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 	fb, err := wire.ParseFeedback(b)
 	if err != nil {
@@ -472,10 +509,10 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 // detectLossLocked gives up on packets from the oldest outstanding onwards:
 // those with junkReorderGap later packets acknowledged, and those out for
 // longer than the timeout. If the timeout fires with no ack at all in that
-// time the path has gone quiet, and Copa is told to start over.
+// time the path has gone quiet, and the controller is told to start over.
 func (s *junkSender) detectLossLocked(now time.Time) {
 	rto := max(junkMinRTO, 4*s.cc.SRTT())
-	lost, timedOut := 0, false
+	timedOut := false
 	for ; s.oldest != s.nextSeq; s.oldest++ {
 		p, ok := s.sent[s.oldest]
 		if !ok {
@@ -488,7 +525,7 @@ func (s *junkSender) detectLossLocked(now time.Time) {
 		}
 		delete(s.sent, s.oldest)
 		s.c.Lost++
-		lost++
+		s.cc.OnLoss(now, p.at)
 		if !behind {
 			s.c.TimedOut++
 			timedOut = true
@@ -496,9 +533,6 @@ func (s *junkSender) detectLossLocked(now time.Time) {
 		if s.logPkts {
 			s.logf("lost", now, map[string]any{"seq": s.oldest, "timeout": !behind})
 		}
-	}
-	if lost > 0 {
-		s.cc.OnLoss(now, lost)
 	}
 	if timedOut && now.Sub(s.lastAck) > rto {
 		s.cc.OnTimeout()
@@ -509,15 +543,27 @@ func (s *junkSender) detectLossLocked(now time.Time) {
 func (s *junkSender) snapshot() (map[string]any, junkCounters) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.cc.Stats()
 	bps := func(pps float64) float64 { return pps * wire.MaxMessage * 8 }
 	snap := map[string]any{
-		"counters": s.c, "inFlight": len(s.sent), "copa": st, "packetBytes": wire.MaxMessage,
-		// Copa's rates as bits per second of DataChannel messages.
-		"windowBitrate": bps(st.CurrentRate), "pacingBitrate": bps(st.PacingRate),
+		"counters": s.c, "inFlight": len(s.sent), "packetBytes": wire.MaxMessage,
+		"cwnd": s.cc.Cwnd(), "srttMs": ms(s.cc.SRTT()),
+		// Rates are bits per second of DataChannel messages.
+		"pacingBitrate": bps(s.cc.PacingRate()),
 	}
-	if st.TargetRate != nil {
-		snap["targetBitrate"] = bps(*st.TargetRate)
+	// The controller's own state goes under its name; windowBitrate is what
+	// its window amounts to as a rate.
+	switch cc := s.cc.(type) {
+	case *copa.Copa:
+		st := cc.Stats()
+		snap["algorithm"], snap["copa"] = "copa", st
+		snap["windowBitrate"] = bps(st.CurrentRate)
+		if st.TargetRate != nil {
+			snap["targetBitrate"] = bps(*st.TargetRate)
+		}
+	case *cubic.Cubic:
+		st := cc.Stats(time.Now())
+		snap["algorithm"], snap["cubic"] = "cubic", st
+		snap["windowBitrate"] = bps(st.CurrentRate)
 	}
 	return snap, s.c
 }

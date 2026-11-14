@@ -92,7 +92,7 @@ func (s *sim) run(d time.Duration) {
 				f.inFlight = f.inFlight[1:]
 				if p.lost {
 					f.lost++
-					f.cc.OnLoss(now, 1)
+					f.cc.OnLoss(now, p.sentAt)
 					continue
 				}
 				f.acked++

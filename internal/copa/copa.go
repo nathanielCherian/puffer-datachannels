@@ -298,10 +298,12 @@ func (c *Copa) updateMode(now time.Time, dq time.Duration) {
 	}
 }
 
-// OnLoss reports n lost packets. In default mode Copa does not react to loss
+// OnLoss reports one lost packet. In default mode Copa does not react to loss
 // at all (§5.4); in competitive mode it halves 1/δ, at most once per RTT.
-func (c *Copa) OnLoss(now time.Time, n int) {
-	c.c.Losses += int64(n)
+// When the packet was sent does not matter to Copa; the argument is there so
+// that Copa and CUBIC have the same shape.
+func (c *Copa) OnLoss(now, _ time.Time) {
+	c.c.Losses++
 	if !c.competitive || (!c.lastDeltaCut.IsZero() && now.Sub(c.lastDeltaCut) < c.srtt) {
 		return
 	}

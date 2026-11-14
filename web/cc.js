@@ -1,11 +1,12 @@
 'use strict';
 
 // ---------------------------------------------------------------------------
-// The Copa page. The server sends junk as fast as Copa (internal/copa) lets
-// it; this page is the receiver. It has two jobs:
+// The congestion-control page. The server sends junk as fast as a congestion
+// controller lets it, Copa (internal/copa) or CUBIC (internal/cubic); this
+// page is the receiver. It has two jobs:
 //
-//   1. Acknowledge every DATA packet the moment it arrives. Copa is clocked by
-//      these acks and takes an RTT sample from each one.
+//   1. Acknowledge every DATA packet the moment it arrives. Both controllers
+//      are clocked by these acks and take an RTT sample from each one.
 //   2. Measure what arrives: throughput, one-way delay, queueing delay, jitter,
 //      loss, reordering. Everything under "Measuring" is from the packets
 //      themselves and owes nothing to what the server says about itself.
@@ -25,31 +26,37 @@ const REPORT_MS = 200;
 // 0.5 ms buckets up to 5 s.
 const HIST_STEP_MS = 0.5, HIST_BUCKETS = 10000;
 
-const charts = {
-  rate: new Chart($('c-rate'), [
-    { key: 'recv', name: 'received (client)' },
-    { key: 'sent', name: 'sent' },
-    { key: 'window', name: 'cwnd / RTTstanding (λ)' },
-  ]),
-  delay: new Chart($('c-delay'), [
-    { key: 'owd', name: 'one-way delay, mean (client)' },
-    { key: 'owdP95', name: 'one-way delay, p95 (client)' },
-    { key: 'queue', name: 'queueing delay, mean (client)' },
-    { key: 'standing', name: 'RTTstanding' },
-    { key: 'rttMin', name: 'RTTmin' },
-    { key: 'srtt', name: 'smoothed RTT' },
-  ]),
-  window: new Chart($('c-window'), [
-    { key: 'cwnd', name: 'cwnd' },
-    { key: 'inFlight', name: 'in flight' },
-    { key: 'velocity', name: 'velocity v' },
-    { key: 'invDelta', name: '1/δ' },
-  ]),
-  loss: new Chart($('c-loss'), [
-    { key: 'client', name: 'missing sequence numbers (client)' },
-    { key: 'server', name: 'declared lost by the sender' },
-  ]),
-};
+// The delay and window charts show what the running controller has: Copa's
+// RTTstanding, velocity and 1/δ, or CUBIC's ssthresh and W_max.
+function makeCharts(algorithm) {
+  const copa = algorithm !== 'cubic';
+  return {
+    rate: new Chart($('c-rate'), [
+      { key: 'recv', name: 'received (client)' },
+      { key: 'sent', name: 'sent' },
+      { key: 'window', name: copa ? 'cwnd / RTTstanding (λ)' : 'cwnd / smoothed RTT' },
+    ]),
+    delay: new Chart($('c-delay'), [
+      { key: 'owd', name: 'one-way delay, mean (client)' },
+      { key: 'owdP95', name: 'one-way delay, p95 (client)' },
+      { key: 'queue', name: 'queueing delay, mean (client)' },
+      ...(copa ? [{ key: 'standing', name: 'RTTstanding' }] : []),
+      { key: 'rttMin', name: 'RTTmin' },
+      { key: 'srtt', name: 'smoothed RTT' },
+    ]),
+    window: new Chart($('c-window'), [
+      { key: 'cwnd', name: 'cwnd' },
+      { key: 'inFlight', name: 'in flight' },
+      ...(copa ? [{ key: 'velocity', name: 'velocity v' }, { key: 'invDelta', name: '1/δ' }]
+        : [{ key: 'ssthresh', name: 'ssthresh' }, { key: 'wMax', name: 'W_max' }]),
+    ]),
+    loss: new Chart($('c-loss'), [
+      { key: 'client', name: 'missing sequence numbers (client)' },
+      { key: 'server', name: 'declared lost by the sender' },
+    ]),
+  };
+}
+let charts = makeCharts('copa');
 
 function setStatus(s) { $('status').textContent = s; }
 
@@ -57,7 +64,7 @@ function logEvent(kind, value) {
   const li = document.createElement('li');
   const rel = S.t0 ? ((now() - S.t0) / 1000).toFixed(3) + 's' : '';
   li.textContent = `${rel} ${kind}: ${typeof value === 'object' ? JSON.stringify(value) : value}`;
-  if (/fail|error|closed|timeout|competitive/i.test(`${kind} ${value}`)) li.classList.add('bad');
+  if (/fail|error|closed|timeout|competitive|congestion event/i.test(`${kind} ${value}`)) li.classList.add('bad');
   const list = $('events');
   list.appendChild(li);
   while (list.children.length > 300) list.removeChild(list.firstChild);
@@ -79,12 +86,15 @@ function sendMedia(buf) {
 $('start').onclick = start;
 $('stop').onclick = () => stop('stopped');
 $('download').onclick = downloadCSV;
-const inputs = ['maxRate', 'mode', 'delta', 'duration', 'stun'];
+const inputs = ['algorithm', 'maxRate', 'mode', 'delta', 'duration', 'stun'];
 
 // Show the server's values where a blank field would use them.
+let serverAlgorithm = 'copa';
 fetch('info').then((r) => r.json()).then(({ config }) => {
-  $('maxRate').placeholder = (config.CopaMaxRate / 1e6).toString();
-  $('maxRate').max = config.CopaMaxRate / 1e6;
+  serverAlgorithm = config.CCAlgorithm;
+  $('algorithm').options[0].textContent = `server default (${config.CCAlgorithm})`;
+  $('maxRate').placeholder = (config.CCMaxRate / 1e6).toString();
+  $('maxRate').max = config.CCMaxRate / 1e6;
   $('delta').placeholder = config.CopaDelta;
   $('mode').options[0].textContent = `server default (${config.CopaMode})`;
 }).catch(() => {});
@@ -94,7 +104,7 @@ async function start() {
   $('download').disabled = true;
   for (const id of inputs) $(id).disabled = true;
   $('events').innerHTML = '';
-  for (const c of Object.values(charts)) c.reset();
+  charts = makeCharts($('algorithm').value || serverAlgorithm);
   const t = now();
   Object.assign(S, {
     t0: t, hello: null, server: null, serverAt: null, sessionId: null, logDir: null, rows: [],
@@ -105,7 +115,7 @@ async function start() {
     firstSeq: null, maxSeq: -1, firstAt: null, lastAt: null,
     minTransit: Infinity, lastTransit: null, jitterMs: 0,
     hist: new Uint32Array(HIST_BUCKETS), histN: 0,
-    seen: new Set(), lastMode: null, lastSlowStart: null,
+    seen: new Set(), lastMode: null, lastSlowStart: null, lastEvents: 0, lastTimeouts: 0,
     // The interval being measured, and where the previous one ended.
     win: newWindow(t), prev: { packets: 0, expected: 0, serverLost: 0, serverResolved: 0 },
   });
@@ -140,10 +150,10 @@ async function start() {
     await waitForGathering(pc, 3000);
     const num = (id) => { const v = Number($(id).value); return v > 0 ? v : undefined; };
     const mbps = num('maxRate');
-    const res = await fetch('copa/offer', {
+    const res = await fetch('cc/offer', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        sdp: pc.localDescription.sdp, type: pc.localDescription.type,
+        sdp: pc.localDescription.sdp, type: pc.localDescription.type, algorithm: $('algorithm').value || undefined,
         maxRate: mbps ? Math.round(mbps * 1e6) : undefined, mode: $('mode').value || undefined,
         delta: num('delta'), durationSec: num('duration'),
         client: { userAgent: navigator.userAgent, timeOrigin: performance.timeOrigin, ackRepeat: ACK_REPEAT, reportMs: REPORT_MS },
@@ -195,9 +205,9 @@ function stop(reason) {
 function onCtrl(msg) {
   if (msg.type === 'hello') {
     S.hello = msg;
-    const c = msg.copa;
-    logEvent('hello', `Copa mode ${c.mode}, δ ${c.delta}, at most ${c.maxRate / 1e6} Mbps, ${c.packetBytes}-byte packets` +
-      (c.durationSec ? `, for ${c.durationSec} s` : ''));
+    const c = msg.cc;
+    logEvent('hello', (c.algorithm === 'cubic' ? 'CUBIC' : `Copa mode ${c.mode}, δ ${c.delta}`) +
+      `, at most ${c.maxRate / 1e6} Mbps, ${c.packetBytes}-byte packets` + (c.durationSec ? `, for ${c.durationSec} s` : ''));
   } else if (msg.type === 'server-stats') {
     onServerStats(msg.data);
   } else if (msg.type === 'closed') {
@@ -331,10 +341,12 @@ function report() {
   S.prev.expected = expected; S.prev.packets = S.n.packets;
   const lossPct = due > 0 ? 100 * Math.max(0, 1 - got / due) : (got > 0 ? 0 : null);
 
-  const sv = S.server || {}, cp = sv.copa || {};
+  // ctl is the controller's own state; cp and cu are it by name, one of them
+  // empty, so that a row has the same columns whichever is running.
+  const sv = S.server || {}, ctl = sv[sv.algorithm] || {}, cp = sv.copa || {}, cu = sv.cubic || {};
   const mbps = (bps) => (bps === undefined || bps === null ? null : bps / 1e6);
   const row = {
-    tSec: round((t - S.t0) / 1000),
+    tSec: round((t - S.t0) / 1000), algorithm: sv.algorithm ?? null,
     // Client: measured here.
     recvMbps: round(w.bytes * 8 / dt / 1e6), recvPackets: w.packets, lossPct: round(lossPct),
     owdMeanMs: round(avg(w.owd)), owdP50Ms: round(pct(w.owd, 0.5)), owdP95Ms: round(pct(w.owd, 0.95)), owdMaxMs: round(pct(w.owd, 1)),
@@ -344,10 +356,15 @@ function report() {
     // Server: the sender's latest snapshot, for reading the two side by side.
     srvAgeMs: S.serverAt ? round(t - S.serverAt, 0) : null,
     srvSentMbps: round(mbps(sv.sendBitrate)), srvDeliveredMbps: round(mbps(sv.deliveryBitrate)), srvLossPct: round(sv.lossPct),
-    cwnd: round(cp.cwnd), inFlight: sv.inFlight ?? null, velocity: cp.velocity ?? null, delta: round(cp.delta, 4),
-    mode: cp.mode ?? null, slowStart: cp.slowStart ?? null,
-    rttMinMs: round(cp.rttMinMs), rttStandingMs: round(cp.rttStandingMs), srttMs: round(cp.srttMs), copaQueueMs: round(cp.queueDelayMs),
-    windowMbps: round(mbps(sv.windowBitrate)), targetMbps: round(mbps(sv.targetBitrate)), pacingMbps: round(mbps(sv.pacingBitrate)),
+    cwnd: round(sv.cwnd), inFlight: sv.inFlight ?? null, slowStart: ctl.slowStart ?? null,
+    rttMinMs: round(ctl.rttMinMs), srttMs: round(sv.srttMs),
+    windowMbps: round(mbps(sv.windowBitrate)), pacingMbps: round(mbps(sv.pacingBitrate)),
+    // Copa only.
+    velocity: cp.velocity ?? null, delta: round(cp.delta, 4), mode: cp.mode ?? null,
+    rttStandingMs: round(cp.rttStandingMs), copaQueueMs: round(cp.queueDelayMs), targetMbps: round(mbps(sv.targetBitrate)),
+    // CUBIC only.
+    cubicState: cu.state ?? null, ssthresh: round(cu.ssthresh), wMax: round(cu.wMax), cubicK: round(cu.k),
+    congestionEvents: cu.counters ? cu.counters.CongestionEvents : null,
   };
   S.rows.push(row);
   const total = totals(t);
@@ -359,12 +376,15 @@ function report() {
   for (const c of Object.values(charts)) c.draw(t);
 
   const srv = sv.counters || {};
-  const state = cp.cwnd === undefined ? '–' : `${cp.mode}${cp.slowStart ? ', slow start' : ''}`;
+  const cubic = sv.algorithm === 'cubic';
+  let state = '–';
+  if (cubic) state = `CUBIC, ${cu.state}`;
+  else if (cp.cwnd !== undefined) state = `Copa, ${cp.mode}${cp.slowStart ? ', slow start' : ''}`;
   $('tiles').innerHTML = tilesHTML([
     ['received · client', row.recvMbps, 'Mbps'],
     ['mean since start · client', total.meanMbps, 'Mbps'],
     ['sent', row.srvSentMbps, 'Mbps'],
-    ['cwnd', cp.cwnd, 'pkts'],
+    ['cwnd', sv.cwnd, 'pkts'],
     ['in flight', sv.inFlight, 'pkts'],
     ['state', state, ''],
     ['one-way delay · client', row.owdMeanMs, `ms · p95 ${fmtNum(row.owdP95Ms)}`],
@@ -374,13 +394,22 @@ function report() {
     ['longest gap · client', row.gapMaxMs, 'ms'],
     ['loss, whole run · client', total.lossPct, `% · ${total.packetsMissing} pkts`],
     ['late (reordered) · client', total.late, 'pkts'],
-    ['RTTstanding', cp.rttStandingMs, 'ms'],
-    ['RTTmin', cp.rttMinMs, 'ms'],
-    ['Copa queueing delay', cp.queueDelayMs, 'ms'],
-    ['target rate λt', mbps(sv.targetBitrate) === null ? '∞' : mbps(sv.targetBitrate), 'Mbps'],
+    ['smoothed RTT', sv.srttMs, 'ms'],
+    ['RTTmin', ctl.rttMinMs, 'ms'],
     ['pacing rate', mbps(sv.pacingBitrate), 'Mbps'],
-    ['velocity', cp.velocity, ''],
-    ['δ', cp.delta, ''],
+    ...(cubic ? [
+      ['ssthresh', cu.ssthresh === undefined ? '∞' : cu.ssthresh, 'pkts'],
+      ['W_max', cu.wMax, 'pkts'],
+      ['K', cu.k, `s · ${fmtNum(cu.epochSec)} s into the epoch`],
+      ['congestion events', cu.counters.CongestionEvents, `· ${cu.counters.FastConvergences} fast conv.`],
+      ['Reno-friendly acks', cu.counters.Acks ? 100 * cu.counters.RenoFriendlyAcks / cu.counters.Acks : null, '%'],
+    ] : [
+      ['RTTstanding', cp.rttStandingMs, 'ms'],
+      ['Copa queueing delay', cp.queueDelayMs, 'ms'],
+      ['target rate λt', mbps(sv.targetBitrate) === null ? '∞' : mbps(sv.targetBitrate), 'Mbps'],
+      ['velocity', cp.velocity, ''],
+      ['δ', cp.delta, ''],
+    ]),
     ['declared lost', srv.Lost, `pkts · ${srv.TimedOut || 0} by timeout`],
     ['ping RTT · client', row.pingRttMs, 'ms'],
     ['acks sent · client', S.acksSent, ''],
@@ -394,20 +423,29 @@ function report() {
 function onServerStats(sv) {
   const t = now();
   S.server = sv; S.serverAt = t;
-  const cp = sv.copa || {};
+  const name = sv.algorithm, ctl = sv[name] || {}, cp = sv.copa || {}, cu = sv.cubic || {};
   const mbps = (bps) => (bps === undefined || bps === null ? null : bps / 1e6);
-  // The target rate λt is a tile, not a line: it is 1/(δ·dq), so it shoots
+  // Copa's target rate λt is a tile, not a line: it is 1/(δ·dq), so it shoots
   // off the scale every time the queue empties.
   charts.rate.push(t, { sent: mbps(sv.sendBitrate), window: mbps(sv.windowBitrate) });
-  charts.delay.push(t, { standing: cp.rttStandingMs, rttMin: cp.rttMinMs, srtt: cp.srttMs });
-  charts.window.push(t, { cwnd: cp.cwnd, inFlight: sv.inFlight, velocity: cp.velocity, invDelta: cp.delta ? 1 / cp.delta : null });
+  charts.delay.push(t, { standing: cp.rttStandingMs, rttMin: ctl.rttMinMs, srtt: sv.srttMs });
+  charts.window.push(t, {
+    cwnd: sv.cwnd, inFlight: sv.inFlight,
+    velocity: cp.velocity, invDelta: cp.delta ? 1 / cp.delta : null,
+    ssthresh: cu.ssthresh, wMax: cu.wMax || null,
+  });
   charts.loss.push(t, { server: sv.lossPct ?? 0 });
   $('t-server').textContent = JSON.stringify(sv, null, 1);
   // Changes of state are worth a line in Events.
-  if (S.lastMode !== null && cp.mode !== S.lastMode) logEvent('copa', `mode ${S.lastMode} → ${cp.mode}`);
-  if (S.lastSlowStart === true && cp.slowStart === false) logEvent('copa', `left slow start at cwnd ${fmtNum(cp.cwnd)}`);
-  if (S.lastSlowStart === false && cp.slowStart === true) logEvent('copa', 'timeout: back to slow start');
-  S.lastMode = cp.mode; S.lastSlowStart = cp.slowStart;
+  const c = ctl.counters || {};
+  if (S.lastMode !== null && cp.mode !== undefined && cp.mode !== S.lastMode) logEvent(name, `mode ${S.lastMode} → ${cp.mode}`);
+  if (S.lastSlowStart === true && ctl.slowStart === false && !(c.CongestionEvents > 0)) logEvent(name, `left slow start at cwnd ${fmtNum(sv.cwnd)}`);
+  if (c.Timeouts > S.lastTimeouts) logEvent(name, 'timeout: back to slow start');
+  if (c.CongestionEvents > S.lastEvents) {
+    logEvent(name, `congestion event ${c.CongestionEvents}: cwnd ${fmtNum(sv.cwnd)}, W_max ${fmtNum(cu.wMax)}, K ${fmtNum(cu.k)} s`);
+  }
+  S.lastMode = cp.mode ?? null; S.lastSlowStart = ctl.slowStart;
+  S.lastEvents = c.CongestionEvents || 0; S.lastTimeouts = c.Timeouts || 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +461,7 @@ function downloadCSV() {
   if (!S.rows.length) return;
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([buildCSV(S.rows)], { type: 'text/csv' }));
-  a.download = `copa-${S.sessionId || 'session'}.csv`;
+  a.download = `cc-${(S.hello && S.hello.cc.algorithm) || 'run'}-${S.sessionId || 'session'}.csv`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }

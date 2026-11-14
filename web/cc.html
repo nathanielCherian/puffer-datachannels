@@ -3,20 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Copa over a DataChannel</title>
+<title>Congestion control over a DataChannel</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header>
-  <h1>Copa <small>junk data over an unreliable DataChannel · <a href="./">video page</a></small></h1>
+  <h1>Congestion control <small>Copa or CUBIC, junk data over an unreliable DataChannel · <a href="./">video page</a></small></h1>
   <div class="controls">
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
     <button id="download" disabled>Download metrics (CSV)</button>
+    <label class="inline">Algorithm
+      <select id="algorithm">
+        <option value="">server default</option>
+        <option value="copa">Copa</option>
+        <option value="cubic">CUBIC</option>
+      </select>
+    </label>
     <details class="settings">
       <summary>Settings</summary>
       <label>Rate cap (Mbps, blank = the server's maximum) <input id="maxRate" type="number" min="0.1" step="0.5"></label>
-      <label>Mode
+      <label>Copa: mode
         <select id="mode">
           <option value="">server default</option>
           <option value="default">default: δ fixed, delay-based only</option>
@@ -24,7 +31,7 @@
           <option value="competitive">competitive: AIMD on 1/δ</option>
         </select>
       </label>
-      <label>δ in default mode (blank = server default; Copa queues about 1/δ packets) <input id="delta" type="number" min="0.01" max="2" step="0.05"></label>
+      <label>Copa: δ in default mode (blank = server default; Copa queues about 1/δ packets) <input id="delta" type="number" min="0.01" max="2" step="0.05"></label>
       <label>Stop after (s, blank = until Stop or the server's limit) <input id="duration" type="number" min="1" step="5"></label>
       <label>STUN URL (optional) <input id="stun" type="text" placeholder="stun:stun.l.google.com:19302"></label>
     </details>
@@ -35,7 +42,7 @@
 <main>
   <section class="player">
     <div id="tiles" class="tiles"></div>
-    <p class="note">The server sends random bytes as fast as Copa allows; this page acknowledges each packet as it arrives and measures what it receives. Tiles marked <b>client</b> are measured here, the others are the sender's state. Rates count DataChannel message bytes; SCTP, DTLS, UDP and IP add about 8%.</p>
+    <p class="note">The server sends random bytes as fast as the congestion controller allows; this page acknowledges each packet as it arrives and measures what it receives. Tiles marked <b>client</b> are measured here, the others are the sender's state. Rates count DataChannel message bytes; SCTP, DTLS, UDP and IP add about 8%.</p>
   </section>
 
   <section class="charts">
@@ -53,6 +60,6 @@
 </main>
 <script src="chart.js"></script>
 <script src="wire.js"></script>
-<script src="copa.js"></script>
+<script src="cc.js"></script>
 </body>
 </html>

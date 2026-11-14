@@ -51,11 +51,12 @@ type Config struct {
 	MaxSessions                          int
 	ICEServers                           []webrtc.ICEServer `json:"-"`
 
-	// The Copa page (copa.go).
-	CopaMode        string        // default, auto or competitive
-	CopaDelta       float64       // δ in default mode
-	CopaMaxRate     int           // bps: the most a Copa session may send
-	CopaMaxDuration time.Duration // a Copa session is closed after this long; 0 = never
+	// The congestion-control page (cc.go).
+	CCAlgorithm   string        // copa or cubic
+	CCMaxRate     int           // bps: the most a cc session may send
+	CCMaxDuration time.Duration // a cc session is closed after this long; 0 = never
+	CopaMode      string        // Copa: default, auto or competitive
+	CopaDelta     float64       // Copa: δ in default mode
 }
 
 // Settings applies what this design needs from pion to a SettingEngine.
@@ -91,7 +92,7 @@ type Manager struct {
 	host     map[string]any
 
 	mu       sync.Mutex
-	sessions map[string]closer // media and Copa sessions alike
+	sessions map[string]closer // media and cc sessions alike
 }
 
 type closer interface{ Close(reason string) }

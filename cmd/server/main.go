@@ -69,10 +69,11 @@ func main() {
 		logDir       = flag.String("log-dir", "logs", "root directory for per-session log directories")
 		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent sessions (a viewer is one ffmpeg decode and one x264 encode)")
 
-		copaMode     = flag.String("copa-mode", "default", "copa page: default (δ fixed), auto (the paper's mode switching) or competitive")
-		copaDelta    = flag.Float64("copa-delta", 0.5, "copa page: δ in default mode; Copa keeps about 1/δ packets queued")
-		copaMaxRate  = flag.Int("copa-max-rate", 20_000_000, "copa page: the most a session may send (bps); the page can ask for less")
-		copaMaxDur   = flag.Duration("copa-max-duration", 10*time.Minute, "copa page: close a session after this long (0 = never)")
+		ccAlgorithm  = flag.String("cc-algorithm", "copa", "cc page: congestion controller when the page does not choose: "+strings.Join(session.Algorithms(), ", "))
+		ccMaxRate    = flag.Int("cc-max-rate", 20_000_000, "cc page: the most a session may send (bps); the page can ask for less")
+		ccMaxDur     = flag.Duration("cc-max-duration", 10*time.Minute, "cc page: close a session after this long (0 = never)")
+		copaMode     = flag.String("copa-mode", "default", "cc page, Copa: default (δ fixed), auto (the paper's mode switching) or competitive")
+		copaDelta    = flag.Float64("copa-delta", 0.5, "cc page, Copa: δ in default mode; Copa keeps about 1/δ packets queued")
 		emulateRate  = flag.Int("emulate-rate", 0, "testing: a bottleneck of this many bps for everything the server sends, all sessions together")
 		emulateQueue = flag.Duration("emulate-queue", 200*time.Millisecond, "testing: the --emulate-rate bottleneck's drop-tail buffer, as time to drain it")
 	)
@@ -87,8 +88,11 @@ func main() {
 	if _, err := ratecontrol.New(*cc, ratecontrol.Config{}); err != nil {
 		log.Fatal(err)
 	}
-	if !copa.ValidMode(copa.Mode(*copaMode)) || *copaDelta < 0.01 || *copaDelta > 2 || *copaMaxRate < *minBitrate {
-		log.Fatal("--copa-mode must be default, auto or competitive, --copa-delta within 0.01..2, --copa-max-rate at least --min-bitrate")
+	if !copa.ValidMode(copa.Mode(*copaMode)) || *copaDelta < 0.01 || *copaDelta > 2 {
+		log.Fatal("--copa-mode must be default, auto or competitive, and --copa-delta within 0.01..2")
+	}
+	if !session.ValidAlgorithm(*ccAlgorithm) || *ccMaxRate < *minBitrate {
+		log.Fatalf("--cc-algorithm must be one of %v, and --cc-max-rate at least --min-bitrate", session.Algorithms())
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -145,7 +149,7 @@ func main() {
 		X264Preset: *preset, X264Threads: *threads, MaxQueue: *maxQueue, History: *history,
 		FeedbackInterval: *fbInterval, SnapshotInterval: *snapInt, LogPackets: *logPackets,
 		LogDir: *logDir, ConnectTimeout: 30 * time.Second, MaxSessions: *maxSessions, ICEServers: iceServers,
-		CopaMode: *copaMode, CopaDelta: *copaDelta, CopaMaxRate: *copaMaxRate, CopaMaxDuration: *copaMaxDur,
+		CCAlgorithm: *ccAlgorithm, CCMaxRate: *ccMaxRate, CCMaxDuration: *ccMaxDur, CopaMode: *copaMode, CopaDelta: *copaDelta,
 	}
 	hostname, _ := os.Hostname()
 	mgr := session.NewManager(cfg, info, se, map[string]any{
@@ -170,14 +174,14 @@ func main() {
 		resp, err := mgr.HandleOffer(r.Context(), req, r.RemoteAddr)
 		writeOfferResponse(w, r, resp, err)
 	})
-	// The Copa page (web/copa.html): junk data under Copa's control.
-	mux.HandleFunc("POST /copa/offer", func(w http.ResponseWriter, r *http.Request) {
-		var req session.CopaRequest
+	// The congestion-control page (web/cc.html): junk data under Copa or CUBIC.
+	mux.HandleFunc("POST /cc/offer", func(w http.ResponseWriter, r *http.Request) {
+		var req session.CCRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid offer"})
 			return
 		}
-		resp, err := mgr.HandleCopaOffer(r.Context(), req, r.RemoteAddr)
+		resp, err := mgr.HandleCCOffer(r.Context(), req, r.RemoteAddr)
 		writeOfferResponse(w, r, resp, err)
 	})
 

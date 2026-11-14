@@ -36,5 +36,6 @@ pre { font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; white-spac
 #video { width: 100%; height: auto; max-height: 60vh; object-fit: contain; background: #000; border-radius: 8px; display: block; }
 
 label.inline { font-size: 13px; margin-left: 8px; }
+label.inline select { font: inherit; padding: 3px 6px; border: 1px solid var(--grid); border-radius: 4px; background: var(--card); color: var(--fg); }
 h1 a { color: var(--accent); }
 .note { color: var(--muted); font-size: 13px; margin: 10px 2px 0; }
