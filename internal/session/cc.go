@@ -40,8 +40,9 @@ import (
 // its lock held.
 type controller interface {
 	// OnAck: one packet was acknowledged at now; it left at sentAt, when Cwnd
-	// was cwndAtSend, and measured rtt.
-	OnAck(now, sentAt time.Time, rtt time.Duration, cwndAtSend float64)
+	// was cwndAtSend, and measured rtt. windowFull: the window, not the pacer,
+	// was what stopped the sender sending more when the ack arrived.
+	OnAck(now, sentAt time.Time, rtt time.Duration, cwndAtSend float64, windowFull bool)
 	// OnLoss: one packet, sent at sentAt, was given up on at now.
 	OnLoss(now, sentAt time.Time)
 	// OnTimeout: nothing at all was acknowledged for a timeout.
@@ -369,6 +370,11 @@ type junkSender struct {
 	lastAck    time.Time             // when anything was last acknowledged
 	c          junkCounters
 
+	// Loss detection (detectLossLocked).
+	newestAckedSent time.Time            // the latest send time among acknowledged packets
+	reoMult         int                  // the reordering window is this many quarters of srtt
+	lostAt          map[uint32]time.Time // recently declared lost, to notice one arriving after all
+
 	wake chan struct{}
 }
 
@@ -380,15 +386,17 @@ type junkPacket struct {
 type junkCounters struct {
 	Packets, Bytes    int64
 	Acked, AckedBytes int64
-	Lost              int64 // TimedOut included
+	Lost              int64 // TimedOut and Spurious included
 	TimedOut          int64 // lost because unacknowledged for too long, not because later packets were acked
-	RepeatAcks        int64 // an arrival reported again (every one is, by design), or reported after it was declared lost
+	Spurious          int64 // declared lost, then acknowledged: it had only been overtaken
+	RepeatAcks        int64 // an arrival reported again (every one is, by design)
 	Feedbacks         int64
 	WriteErrors       int64
 }
 
 const (
-	// junkReorderGap: a packet is lost once this many sent after it are acked.
+	// junkReorderGap: a packet can only be lost once this many sent after it
+	// are acked (and see detectLossLocked for the second condition).
 	junkReorderGap = 3
 	// junkMinRTO: the least time a packet stays unacknowledged before it is
 	// given up on. The timeout proper is four smoothed RTTs.
@@ -399,7 +407,8 @@ func newJunkSender(write func([]byte) error, cc controller, logPkts bool, logf f
 	junk := make([]byte, wire.MaxPayload)
 	_, _ = rand.Read(junk)
 	return &junkSender{write: write, cc: cc, logf: logf, logPkts: logPkts, junk: junk,
-		sent: map[uint32]junkPacket{}, highestAck: -1, wake: make(chan struct{}, 1)}
+		sent: map[uint32]junkPacket{}, highestAck: -1, wake: make(chan struct{}, 1),
+		reoMult: 1, lostAt: map[uint32]time.Time{}}
 }
 
 func (s *junkSender) kick() {
@@ -485,9 +494,24 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 	for _, a := range fb.Acks {
 		p, ok := s.sent[a.Seq]
 		if !ok {
-			s.c.RepeatAcks++
+			if _, wasLost := s.lostAt[a.Seq]; wasLost {
+				// It was only late. The controller has already been told it was
+				// lost and that is not taken back, but the next one gets longer.
+				delete(s.lostAt, a.Seq)
+				s.c.Spurious++
+				s.reoMult = min(s.reoMult+1, 4)
+				if s.logPkts {
+					s.logf("spurious", arrival, map[string]any{"seq": a.Seq, "reorderWindowMs": ms(s.reorderWindowLocked())})
+				}
+			} else {
+				s.c.RepeatAcks++
+			}
 			continue
 		}
+		// Was the window what held the sender back just now? Two packets of
+		// slack: the pacer releases packets a moment after the acks that make
+		// room for them.
+		windowFull := float64(len(s.sent)) >= s.cc.Cwnd()-2
 		delete(s.sent, a.Seq)
 		// How long the browser held the arrival before this message left: next
 		// to nothing for the newest, one or more packet intervals for repeats.
@@ -497,7 +521,10 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 		s.c.AckedBytes += wire.MaxMessage
 		s.highestAck = max(s.highestAck, int64(a.Seq))
 		s.lastAck = arrival
-		s.cc.OnAck(arrival, p.at, rtt, p.cwnd)
+		if p.at.After(s.newestAckedSent) {
+			s.newestAckedSent = p.at
+		}
+		s.cc.OnAck(arrival, p.at, rtt, p.cwnd, windowFull)
 		if s.logPkts {
 			s.logf("ack", arrival, map[string]any{"seq": a.Seq, "rttMs": ms(rtt), "recvMs": a.RecvMs, "holdMs": ms(hold), "cwnd": s.cc.Cwnd()})
 		}
@@ -506,24 +533,42 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 	s.kick()
 }
 
-// detectLossLocked gives up on packets from the oldest outstanding onwards:
-// those with junkReorderGap later packets acknowledged, and those out for
-// longer than the timeout. If the timeout fires with no ack at all in that
-// time the path has gone quiet, and the controller is told to start over.
+// reorderWindowLocked is how much later than a packet another must have been
+// sent, and acknowledged, before the first is given up on: a quarter of the
+// smoothed RTT, and another quarter for every time that turned out to be too
+// short (up to the whole of it).
+func (s *junkSender) reorderWindowLocked() time.Duration {
+	return max(s.cc.SRTT()*time.Duration(s.reoMult)/4, time.Millisecond)
+}
+
+// detectLossLocked gives up on packets from the oldest outstanding onwards.
+//
+// A packet is lost when junkReorderGap packets sent after it have been
+// acknowledged and one of them was sent more than the reordering window after
+// it. Counting packets alone is not enough: at 20 Mbps three packets are
+// 1.4 ms, and a real path reorders by more than that, so packets that were
+// merely overtaken would be reported to the controller as losses (as RACK,
+// RFC 8985, explains for TCP).
+//
+// A packet is also lost when it has been out for longer than the timeout. If
+// that happens with no ack at all in that time the path has gone quiet, and
+// the controller is told to start over.
 func (s *junkSender) detectLossLocked(now time.Time) {
 	rto := max(junkMinRTO, 4*s.cc.SRTT())
+	reoWnd := s.reorderWindowLocked()
 	timedOut := false
 	for ; s.oldest != s.nextSeq; s.oldest++ {
 		p, ok := s.sent[s.oldest]
 		if !ok {
 			continue // acknowledged
 		}
-		behind := int64(s.oldest) < s.highestAck-junkReorderGap+1
+		behind := int64(s.oldest) < s.highestAck-junkReorderGap+1 && p.at.Add(reoWnd).Before(s.newestAckedSent)
 		late := now.Sub(p.at) > rto
 		if !behind && !late {
 			break
 		}
 		delete(s.sent, s.oldest)
+		s.lostAt[s.oldest] = now
 		s.c.Lost++
 		s.cc.OnLoss(now, p.at)
 		if !behind {
@@ -538,6 +583,14 @@ func (s *junkSender) detectLossLocked(now time.Time) {
 		s.cc.OnTimeout()
 		s.lastAck = now
 	}
+	// A packet that has not turned up within a few timeouts never will.
+	if len(s.lostAt) > 1024 {
+		for seq, at := range s.lostAt {
+			if now.Sub(at) > 4*rto {
+				delete(s.lostAt, seq)
+			}
+		}
+	}
 }
 
 func (s *junkSender) snapshot() (map[string]any, junkCounters) {
@@ -546,7 +599,7 @@ func (s *junkSender) snapshot() (map[string]any, junkCounters) {
 	bps := func(pps float64) float64 { return pps * wire.MaxMessage * 8 }
 	snap := map[string]any{
 		"counters": s.c, "inFlight": len(s.sent), "packetBytes": wire.MaxMessage,
-		"cwnd": s.cc.Cwnd(), "srttMs": ms(s.cc.SRTT()),
+		"cwnd": s.cc.Cwnd(), "srttMs": ms(s.cc.SRTT()), "reorderWindowMs": ms(s.reorderWindowLocked()),
 		// Rates are bits per second of DataChannel messages.
 		"pacingBitrate": bps(s.cc.PacingRate()),
 	}

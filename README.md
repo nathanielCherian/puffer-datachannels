@@ -119,9 +119,14 @@ encoder, no retransmission.
 # http://localhost:8080/cc.html, choose an algorithm, press Start
 ```
 
-Without `--emulate-rate` (or a real bottleneck) there is nothing on localhost
-for a controller to find, and it sends at `--cc-max-rate`. The emulated link
-is shared by every session, so two tabs compete for it.
+Without `--emulate-rate` (or a real bottleneck) there is nothing for a
+controller to find, and it sends at `--cc-max-rate`. That goes for a deployed
+server too: on a path that carries the cap without queueing, both controllers
+sit at the cap, and CUBIC in particular shows no sawtooth, because it only
+probes while its window is what limits it. The page says so in Events when
+that is the case. To see CUBIC work there, give it a bottleneck below the cap
+(`--emulate-rate`) or a cap above what the path carries. The emulated link is
+shared by every session, so two tabs compete for it.
 
 **Copa** is `internal/copa`: no clock, no I/O, one call per ack. It
 is §2 of the paper: RTTmin over 10 s and RTTstanding over srtt/2, queueing
@@ -142,14 +147,23 @@ curve would be slower than Reno; a loss multiplies the window by 0.7, once per
 window of losses; fast convergence lowers `W_max` when a loss comes below the
 previous peak; a timeout restarts slow start. C = 0.4, β = 0.7. Pacing is
 Linux's (twice cwnd/srtt in slow start, 1.2 times after), since the RFC
-defines none. Left out: HyStart++ and the undo of spurious reductions.
+defines none. While the window is not full (the sender is held by the rate
+cap) nothing moves: not the window, not the Reno estimate, not the epoch's
+clock (§5.8, §4.2). Left out: HyStart++ and the undo of spurious reductions.
 
 **The sender** is `internal/session/cc.go`, the same for both: anything with
 the six methods of its `controller` interface can drive it. A packet leaves
-when fewer than cwnd are unacknowledged and the pacer's budget allows. A
-packet is lost once three later ones are acknowledged, or after max(1 s,
-4 srtt); if nothing at all was acknowledged in that time the controller is
-told to start over.
+when fewer than cwnd are unacknowledged and the pacer's budget allows.
+
+A packet is lost once three sent after it are acknowledged and one of those
+left more than a reordering window after it, or after max(1 s, 4 srtt); if
+nothing at all was acknowledged in that time the controller is told to start
+over. The reordering window is a quarter of the smoothed RTT. Counting packets
+alone is not enough on a real path: at 20 Mbps three packets are 1.4 ms, and
+over a 4 ms campus path 13 of 36 "losses" in 30 s were packets that had only
+been overtaken. If a packet declared lost is acknowledged after all, it is
+counted as spurious and the window grows by another quarter, up to the whole
+RTT. The controller is not told to undo its reduction.
 
 **Acks.** The page acknowledges each packet as it arrives (media reports every
 50 ms; these controllers need the ack clock and an RTT per packet). An ack is a FEEDBACK

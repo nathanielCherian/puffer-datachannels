@@ -115,7 +115,8 @@ async function start() {
     firstSeq: null, maxSeq: -1, firstAt: null, lastAt: null,
     minTransit: Infinity, lastTransit: null, jitterMs: 0,
     hist: new Uint32Array(HIST_BUCKETS), histN: 0,
-    seen: new Set(), lastMode: null, lastSlowStart: null, lastEvents: 0, lastTimeouts: 0,
+    seen: new Set(), lastMode: null, lastSlowStart: null, lastEvents: 0, lastTimeouts: 0, lastSpurious: 0,
+    capWarned: false, prevAcks: null,
     // The interval being measured, and where the previous one ended.
     win: newWindow(t), prev: { packets: 0, expected: 0, serverLost: 0, serverResolved: 0 },
   });
@@ -365,6 +366,10 @@ function report() {
     // CUBIC only.
     cubicState: cu.state ?? null, ssthresh: round(cu.ssthresh), wMax: round(cu.wMax), cubicK: round(cu.k),
     congestionEvents: cu.counters ? cu.counters.CongestionEvents : null,
+    appLimitedAcks: cu.counters ? cu.counters.AppLimitedAcks : null,
+    // Loss detection, either controller.
+    srvLost: sv.counters ? sv.counters.Lost : null, srvSpurious: sv.counters ? sv.counters.Spurious : null,
+    reorderWindowMs: round(sv.reorderWindowMs),
   };
   S.rows.push(row);
   const total = totals(t);
@@ -403,6 +408,7 @@ function report() {
       ['K', cu.k, `s · ${fmtNum(cu.epochSec)} s into the epoch`],
       ['congestion events', cu.counters.CongestionEvents, `· ${cu.counters.FastConvergences} fast conv.`],
       ['Reno-friendly acks', cu.counters.Acks ? 100 * cu.counters.RenoFriendlyAcks / cu.counters.Acks : null, '%'],
+      ['acks with the window not full', cu.counters.Acks ? 100 * cu.counters.AppLimitedAcks / cu.counters.Acks : null, '%'],
     ] : [
       ['RTTstanding', cp.rttStandingMs, 'ms'],
       ['Copa queueing delay', cp.queueDelayMs, 'ms'],
@@ -410,7 +416,8 @@ function report() {
       ['velocity', cp.velocity, ''],
       ['δ', cp.delta, ''],
     ]),
-    ['declared lost', srv.Lost, `pkts · ${srv.TimedOut || 0} by timeout`],
+    ['declared lost', srv.Lost, `pkts · ${srv.TimedOut || 0} by timeout · ${srv.Spurious || 0} only late`],
+    ['reordering window', sv.reorderWindowMs, 'ms'],
     ['ping RTT · client', row.pingRttMs, 'ms'],
     ['acks sent · client', S.acksSent, ''],
     ['SCTP buffered', sv.sctpBufferedBytes, 'bytes'],
@@ -445,7 +452,24 @@ function onServerStats(sv) {
     logEvent(name, `congestion event ${c.CongestionEvents}: cwnd ${fmtNum(sv.cwnd)}, W_max ${fmtNum(cu.wMax)}, K ${fmtNum(cu.k)} s`);
   }
   S.lastMode = cp.mode ?? null; S.lastSlowStart = ctl.slowStart;
-  S.lastEvents = c.CongestionEvents || 0; S.lastTimeouts = c.Timeouts || 0;
+  const spurious = (sv.counters || {}).Spurious || 0;
+  if (spurious > S.lastSpurious) {
+    logEvent('loss detection', `${spurious - S.lastSpurious} packet(s) declared lost arrived after all: reordering window now ${fmtNum(sv.reorderWindowMs)} ms`);
+  }
+  // CUBIC only probes when its window is what limits it. If most acks find
+  // the window not full, the rate cap (or the sender itself) is the limit and
+  // there will be no sawtooth to see: say so, once.
+  if (name === 'cubic' && S.prevAcks && c.Acks - S.prevAcks.acks > 200 && !S.capWarned && sv.uptimeSec > 3) {
+    const share = (c.AppLimitedAcks - S.prevAcks.limited) / (c.Acks - S.prevAcks.acks);
+    if (share > 0.8) {
+      S.capWarned = true;
+      const cap = S.hello ? `${S.hello.cc.maxRate / 1e6} Mbps` : 'the cap';
+      logEvent('cubic', `the window is not the limit: the path carries the rate cap (${cap}) without filling it, so CUBIC is not probing. ` +
+        'A bottleneck below the cap (or a higher cap) is needed to see it work');
+    }
+  }
+  if (name === 'cubic' && (!S.prevAcks || c.Acks - S.prevAcks.acks > 200)) S.prevAcks = { acks: c.Acks, limited: c.AppLimitedAcks };
+  S.lastEvents = c.CongestionEvents || 0; S.lastTimeouts = c.Timeouts || 0; S.lastSpurious = spurious;
 }
 
 // ---------------------------------------------------------------------------

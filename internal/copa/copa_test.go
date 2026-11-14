@@ -97,7 +97,7 @@ func (s *sim) run(d time.Duration) {
 				}
 				f.acked++
 				f.ackedWin++
-				f.cc.OnAck(now, p.sentAt, p.ackAt.Sub(p.sentAt), p.cwnd)
+				f.cc.OnAck(now, p.sentAt, p.ackAt.Sub(p.sentAt), p.cwnd, true)
 			}
 			f.budget = math.Min(f.budget+step.Seconds()*f.cc.PacingRate(), 2)
 			for f.budget >= 0 && float64(len(f.inFlight)+1) <= f.cc.Cwnd() {
@@ -298,7 +298,7 @@ func TestTimeoutRestartsSlowStart(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	for i := 0; i < 50; i++ {
 		now = now.Add(time.Millisecond)
-		c.OnAck(now, now.Add(-20*time.Millisecond), 20*time.Millisecond, c.Cwnd())
+		c.OnAck(now, now.Add(-20*time.Millisecond), 20*time.Millisecond, c.Cwnd(), true)
 	}
 	if c.Cwnd() != 60 {
 		t.Fatalf("cwnd %.1f after 50 acks in slow start, want 60", c.Cwnd())

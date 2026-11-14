@@ -22,8 +22,8 @@
 // retransmitted, so "recovery" is only the time until a packet sent after the
 // reduction is acknowledged; the window does not grow during it. The
 // reduction is taken from cwnd rather than the flight size (§4.6 allows
-// either), which is safe here because the sender always fills the window or
-// is held by MaxRate, and MaxRate bounds the window.
+// either), which is safe because the window never grows beyond what is in
+// flight: see OnAck's windowFull.
 package cubic
 
 import (
@@ -38,10 +38,9 @@ type Config struct {
 	InitCwnd float64 // packets [10]
 	MinCwnd  float64 // packets [2]
 	MaxCwnd  float64 // packets [1e6]
-	// MaxRate caps the sender in packets per second (0 = no cap), standing in
-	// for an application with only so much to send. The pacing rate never
-	// exceeds it, and the window stops growing at twice what that rate keeps
-	// in flight (§5.8: a window that is not being used must not grow).
+	// MaxRate caps the pacing rate in packets per second (0 = no cap),
+	// standing in for an application with only so much to send. The window
+	// needs no cap of its own: it only grows while it is full (see OnAck).
 	MaxRate float64
 }
 
@@ -84,6 +83,10 @@ type Cubic struct {
 	inRecovery    bool
 	afterTimeout  bool // the next epoch is the first since a timeout
 
+	// When the previous ack arrived, for taking time in which the window was
+	// not the limit out of the epoch.
+	prevAck time.Time
+
 	srtt, latest, rttMin time.Duration
 	c                    Counters
 }
@@ -94,6 +97,7 @@ type Counters struct {
 	CongestionEvents int64 // window reductions: at most one per window of losses
 	Timeouts         int64
 	FastConvergences int64
+	AppLimitedAcks   int64 // acks that found the window not full, and so did not grow it
 	RenoFriendlyAcks int64 // acks on which the Reno estimate, not the cubic curve, set the window
 }
 
@@ -136,13 +140,23 @@ func (c *Cubic) PacingRate() float64 {
 
 // OnAck processes the acknowledgement of one packet. now is when the ack
 // arrived, sentAt when the packet left and rtt the round trip it measured.
-// The last argument (the window when the packet left) is not used; it is
-// there so that Copa and CUBIC have the same shape.
-func (c *Cubic) OnAck(now, sentAt time.Time, rtt time.Duration, _ float64) {
+// The window when the packet left is not used; it is there so that Copa and
+// CUBIC have the same shape.
+//
+// windowFull says whether the window was what held the sender back when this
+// ack arrived. If it was not (the sender is limited by its rate cap, or has
+// nothing to send), the window is not being tested by the network and must
+// not grow (§5.8), and that time does not count towards the epoch (§4.2):
+// otherwise the curve and the Reno estimate would run on ahead of a window
+// nobody is using, and the sender would burst to wherever they had got to the
+// moment the limit went away.
+func (c *Cubic) OnAck(now, sentAt time.Time, rtt time.Duration, _ float64, windowFull bool) {
 	if rtt <= 0 {
 		return
 	}
 	c.c.Acks++
+	prevAck := c.prevAck
+	c.prevAck = now
 	c.latest = rtt
 	if c.srtt == 0 {
 		c.srtt = rtt
@@ -158,6 +172,13 @@ func (c *Cubic) OnAck(now, sentAt time.Time, rtt time.Duration, _ float64) {
 			return
 		}
 		c.inRecovery = false
+	}
+	if !windowFull {
+		c.c.AppLimitedAcks++
+		if !c.epochStart.IsZero() && !prevAck.IsZero() {
+			c.epochStart = c.epochStart.Add(now.Sub(prevAck))
+		}
+		return
 	}
 	defer c.clamp()
 
@@ -242,11 +263,7 @@ func (c *Cubic) reduce() {
 }
 
 func (c *Cubic) clamp() {
-	hi := c.cfg.MaxCwnd
-	if c.cfg.MaxRate > 0 {
-		hi = math.Min(hi, 2*c.cfg.MaxRate*c.rtt().Seconds())
-	}
-	c.cwnd = math.Max(math.Min(c.cwnd, hi), c.cfg.MinCwnd)
+	c.cwnd = math.Max(math.Min(c.cwnd, c.cfg.MaxCwnd), c.cfg.MinCwnd)
 }
 
 // Stats is the controller's state, for logs and the page. Rates are in

@@ -155,8 +155,10 @@ func (c *Copa) SRTT() time.Duration { return c.srtt }
 
 // OnAck processes the acknowledgement of one packet. now is when the ack
 // arrived, sentAt when the packet left, rtt the round trip it measured, and
-// cwndAtSend what Cwnd returned when it left.
-func (c *Copa) OnAck(now, sentAt time.Time, rtt time.Duration, cwndAtSend float64) {
+// cwndAtSend what Cwnd returned when it left. The last argument (whether the
+// window was full) is CUBIC's; Copa bounds an unused window through MaxRate
+// instead.
+func (c *Copa) OnAck(now, sentAt time.Time, rtt time.Duration, cwndAtSend float64, _ bool) {
 	if rtt <= 0 {
 		return
 	}

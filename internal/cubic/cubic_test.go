@@ -70,6 +70,7 @@ func (s *sim) run(d time.Duration) {
 			}
 			for len(f.inFlight) > 0 && !f.inFlight[0].ackAt.After(now) {
 				p := f.inFlight[0]
+				full := windowFull(len(f.inFlight), f.cc.Cwnd())
 				f.inFlight = f.inFlight[1:]
 				if p.lost {
 					f.lost++
@@ -77,7 +78,7 @@ func (s *sim) run(d time.Duration) {
 					continue
 				}
 				f.ackedWin++
-				f.cc.OnAck(now, p.sentAt, p.ackAt.Sub(p.sentAt), 0)
+				f.cc.OnAck(now, p.sentAt, p.ackAt.Sub(p.sentAt), 0, full)
 			}
 			f.budget = math.Min(f.budget+step.Seconds()*f.cc.PacingRate(), 2)
 			for f.budget >= 0 && float64(len(f.inFlight)+1) <= f.cc.Cwnd() {
@@ -96,6 +97,9 @@ func (s *sim) run(d time.Duration) {
 		}
 	}
 }
+
+// windowFull is the sender's rule in internal/session.
+func windowFull(inFlight int, cwnd float64) bool { return float64(inFlight) >= cwnd-2 }
 
 // 1000 packets per second with 100 ms of propagation delay is a BDP of 100
 // packets: large enough for the cubic curve, not Reno's line, to set the
@@ -148,7 +152,7 @@ func TestWindowFollowsTheCubicCurve(t *testing.T) {
 	const rtt = 100 * time.Millisecond
 	// Slow start to 400 packets, then one loss.
 	for c.Cwnd() < 400 {
-		c.OnAck(now, now.Add(-rtt), rtt, 0)
+		c.OnAck(now, now.Add(-rtt), rtt, 0, true)
 	}
 	c.OnLoss(now, now.Add(-rtt))
 	if got := c.Cwnd(); math.Abs(got-280) > 1e-9 {
@@ -164,7 +168,7 @@ func TestWindowFollowsTheCubicCurve(t *testing.T) {
 		now = now.Add(time.Millisecond)
 		credit += c.Cwnd() / 100
 		for ; credit >= 1; credit-- {
-			c.OnAck(now, now.Add(-rtt), rtt, 0)
+			c.OnAck(now, now.Add(-rtt), rtt, 0, true)
 			if epoch.IsZero() && !c.epochStart.IsZero() {
 				epoch = c.epochStart
 			}
@@ -245,8 +249,49 @@ func TestMaxRateCapsTheWindow(t *testing.T) {
 	if math.Abs(r-200) > 4 {
 		t.Errorf("rate %.1f pkt/s, want the 200 cap", r)
 	}
-	if st.Cwnd > 2*200*0.022 || f.lost != 0 {
+	// 200 packets per second over 21 ms is 4.2 in flight: the initial window
+	// of 10 is never full, so it must still be 10.
+	if st.Cwnd != 10 || f.lost != 0 {
 		t.Errorf("cwnd %.1f grew past what the cap can use (%d lost)", st.Cwnd, f.lost)
+	}
+}
+
+// While the window is not what limits the sender, nothing may move: not the
+// window, not the Reno estimate, not the epoch's clock. This is the deployed
+// case of a path faster than the rate cap.
+func TestNothingGrowsWhileTheWindowIsNotFull(t *testing.T) {
+	c := New(Config{})
+	now := time.Unix(1_700_000_000, 0)
+	const rtt = 10 * time.Millisecond
+	for c.Cwnd() < 100 {
+		c.OnAck(now, now.Add(-rtt), rtt, 0, true)
+	}
+	c.OnLoss(now, now.Add(-rtt))
+	step := func(n int, full bool) {
+		for i := 0; i < n; i++ {
+			now = now.Add(time.Millisecond)
+			c.OnAck(now, now.Add(-rtt), rtt, 0, full)
+		}
+	}
+	step(1000, true) // one second into the epoch
+	before := c.Stats(now)
+	step(60_000, false) // a minute of not filling the window
+	after := c.Stats(now)
+	t.Logf("before: cwnd %.2f, wEst %.2f, epoch %.3f s; after a minute app-limited: cwnd %.2f, wEst %.2f, epoch %.3f s",
+		before.Cwnd, before.WEst, before.EpochSec, after.Cwnd, after.WEst, after.EpochSec)
+	if after.Cwnd != before.Cwnd || after.WEst != before.WEst {
+		t.Errorf("cwnd %.2f -> %.2f, wEst %.2f -> %.2f while the window was not full", before.Cwnd, after.Cwnd, before.WEst, after.WEst)
+	}
+	if math.Abs(after.EpochSec-before.EpochSec) > 1e-6 {
+		t.Errorf("the epoch's clock ran from %.3f s to %.3f s while the window was not full", before.EpochSec, after.EpochSec)
+	}
+	if after.Counters.AppLimitedAcks != 60_000 {
+		t.Errorf("%d app-limited acks counted, want 60000", after.Counters.AppLimitedAcks)
+	}
+	// And it picks up where it left off.
+	step(10, true)
+	if got := c.Stats(now); got.Cwnd <= after.Cwnd || got.Cwnd > after.Cwnd+1 {
+		t.Errorf("cwnd %.2f after ten more acks with a full window, want just above %.2f", got.Cwnd, after.Cwnd)
 	}
 }
 
@@ -255,7 +300,7 @@ func TestTimeout(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	const rtt = 50 * time.Millisecond
 	for c.Cwnd() < 100 {
-		c.OnAck(now, now.Add(-rtt), rtt, 0)
+		c.OnAck(now, now.Add(-rtt), rtt, 0, true)
 	}
 	c.OnTimeout()
 	st := c.Stats(now)
@@ -266,10 +311,10 @@ func TestTimeout(t *testing.T) {
 	// inflection point: K = 0, W_max = the window there (§4.8).
 	for c.slowStart() {
 		now = now.Add(time.Millisecond)
-		c.OnAck(now, now.Add(-rtt), rtt, 0)
+		c.OnAck(now, now.Add(-rtt), rtt, 0, true)
 	}
 	now = now.Add(time.Millisecond)
-	c.OnAck(now, now.Add(-rtt), rtt, 0)
+	c.OnAck(now, now.Add(-rtt), rtt, 0, true)
 	if st := c.Stats(now); st.K != 0 || math.Abs(st.WMax-70) > 1e-9 || st.State != "congestion avoidance" {
 		t.Fatalf("first epoch after a timeout: K %.3f, wMax %.2f, state %s", st.K, st.WMax, st.State)
 	}
