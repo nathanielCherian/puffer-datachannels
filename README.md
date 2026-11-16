@@ -179,7 +179,12 @@ time above the lowest seen, which needs no clock offset) with p50/p95/p99;
 RFC 3550 jitter; the longest gap between arrivals. Beside these it shows the
 sender's state from its 100 ms snapshots: cwnd, packets in flight, RTTmin,
 smoothed RTT, pacing rate, and the controller's own (Copa: RTTstanding, δ,
-velocity, mode, target rate; CUBIC: ssthresh, W_max, K, congestion events). Each interval is a
+velocity, mode, target rate; CUBIC: ssthresh, W_max, K, congestion events).
+The rate, delay and window charts mark two kinds of moment with vertical
+bars: a loss, at the time the page saw a later packet arrive in a missing
+one's place (drawn once the missing one has had 300 ms to turn up late), and
+the sender cutting its window (a CUBIC congestion event, Copa in competitive
+mode raising δ, or a timeout). Each interval is a
 row in "Download metrics (CSV)" and a `stats` line in the session's
 `client.jsonl`; `cc.jsonl` has every packet (`sent`, `ack` with its RTT,
 `lost`).

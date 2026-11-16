@@ -28,14 +28,27 @@ const HIST_STEP_MS = 0.5, HIST_BUCKETS = 10000;
 
 // The delay and window charts show what the running controller has: Copa's
 // RTTstanding, velocity and 1/δ, or CUBIC's ssthresh and W_max.
+//
+// The rate, delay and window charts also carry two kinds of vertical bar, so
+// that cause and effect can be read off the same time axis:
+//   loss   a packet this page never received, at the moment its absence
+//          showed (a later packet arrived in its place); see noteGaps
+//   cut    the sender reduced its window: a CUBIC congestion event, Copa
+//          (competitive) raising δ, or a timeout. From the sender's snapshots,
+//          so within 100 ms of when it happened.
+const MARKS = [
+  { key: 'loss', name: 'loss (client)', color: '#d6336c' },
+  { key: 'cut', name: 'sender cut its window', color: '#6b6b70', dash: [4, 3], width: 1.5 },
+];
 function makeCharts(algorithm) {
   const copa = algorithm !== 'cubic';
+  const marks = { marks: MARKS };
   return {
     rate: new Chart($('c-rate'), [
       { key: 'recv', name: 'received (client)' },
       { key: 'sent', name: 'sent' },
       { key: 'window', name: copa ? 'cwnd / RTTstanding (λ)' : 'cwnd / smoothed RTT' },
-    ]),
+    ], marks),
     delay: new Chart($('c-delay'), [
       { key: 'owd', name: 'one-way delay, mean (client)' },
       { key: 'owdP95', name: 'one-way delay, p95 (client)' },
@@ -43,13 +56,13 @@ function makeCharts(algorithm) {
       ...(copa ? [{ key: 'standing', name: 'RTTstanding' }] : []),
       { key: 'rttMin', name: 'RTTmin' },
       { key: 'srtt', name: 'smoothed RTT' },
-    ]),
+    ], marks),
     window: new Chart($('c-window'), [
       { key: 'cwnd', name: 'cwnd' },
       { key: 'inFlight', name: 'in flight' },
       ...(copa ? [{ key: 'velocity', name: 'velocity v' }, { key: 'invDelta', name: '1/δ' }]
         : [{ key: 'ssthresh', name: 'ssthresh' }, { key: 'wMax', name: 'W_max' }]),
-    ]),
+    ], marks),
     loss: new Chart($('c-loss'), [
       { key: 'client', name: 'missing sequence numbers (client)' },
       { key: 'server', name: 'declared lost by the sender' },
@@ -111,12 +124,13 @@ async function start() {
     recent: [], fbSeq: 0, acksSent: 0, ackErrors: 0,
     pings: [], clock: null, pingId: 1, lastRttMs: null,
     // Totals for the run.
-    n: { packets: 0, bytes: 0, late: 0, duplicates: 0 },
+    n: { packets: 0, bytes: 0, late: 0, duplicates: 0, lossMarks: 0 },
     firstSeq: null, maxSeq: -1, firstAt: null, lastAt: null,
     minTransit: Infinity, lastTransit: null, jitterMs: 0,
     hist: new Uint32Array(HIST_BUCKETS), histN: 0,
     seen: new Set(), lastMode: null, lastSlowStart: null, lastEvents: 0, lastTimeouts: 0, lastSpurious: 0,
-    capWarned: false, prevAcks: null,
+    capWarned: false, prevAcks: null, lastDelta: null,
+    gaps: new Map(), // sequence numbers skipped over and not yet arrived -> when the skip showed
     // The interval being measured, and where the previous one ended.
     win: newWindow(t), prev: { packets: 0, expected: 0, serverLost: 0, serverResolved: 0 },
   });
@@ -268,8 +282,17 @@ function measure(seq, sendMs, tRecv, size) {
   n.packets++; n.bytes += size;
   w.packets++; w.bytes += size;
   if (S.firstSeq === null) { S.firstSeq = seq; S.firstAt = tRecv; }
-  // Late: something sent after it arrived before it (reordering).
-  if (seq > S.maxSeq) S.maxSeq = seq; else { n.late++; w.late++; }
+  // Late: something sent after it arrived before it (reordering). Ahead: it
+  // skipped some, which are lost unless they turn up (noteGaps decides).
+  if (seq > S.maxSeq) {
+    if (S.maxSeq >= 0 && seq - S.maxSeq > 1 && seq - S.maxSeq < 5000) {
+      for (let missing = S.maxSeq + 1; missing < seq; missing++) S.gaps.set(missing, tRecv);
+    }
+    S.maxSeq = seq;
+  } else {
+    n.late++; w.late++;
+    S.gaps.delete(seq);
+  }
   if (S.lastAt !== null) w.gapMaxMs = Math.max(w.gapMaxMs, tRecv - S.lastAt);
   S.lastAt = tRecv;
 
@@ -289,6 +312,21 @@ function measure(seq, sendMs, tRecv, size) {
   S.histN++;
   if (S.clock) w.owd.push(transit + S.clock.offsetMs);
 }
+
+// noteGaps turns skipped sequence numbers into loss marks once they have had
+// GAP_WAIT_MS to arrive late. The mark goes at the time the gap appeared, not
+// at the time it was confirmed, so it lines up with the delay and the window
+// at the moment of the loss.
+const GAP_WAIT_MS = 300;
+function noteGaps(t) {
+  for (const [seq, at] of S.gaps) {
+    if (t - at < GAP_WAIT_MS) break; // insertion order is time order
+    S.gaps.delete(seq);
+    S.n.lossMarks++;
+    for (const c of [charts.rate, charts.delay, charts.window]) c.mark('loss', at);
+  }
+}
+function markCut(t) { for (const c of [charts.rate, charts.delay, charts.window]) c.mark('cut', t); }
 
 const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
 // pct sorts its argument.
@@ -333,6 +371,7 @@ function report() {
   const dt = (t - w.at) / 1000;
   if (dt <= 0) return;
   S.win = newWindow(t);
+  noteGaps(t);
 
   // Loss over the interval: of the sequence numbers that became due (up to
   // the highest seen), how many did not arrive. A packet that turns up late
@@ -447,8 +486,14 @@ function onServerStats(sv) {
   const c = ctl.counters || {};
   if (S.lastMode !== null && cp.mode !== undefined && cp.mode !== S.lastMode) logEvent(name, `mode ${S.lastMode} → ${cp.mode}`);
   if (S.lastSlowStart === true && ctl.slowStart === false && !(c.CongestionEvents > 0)) logEvent(name, `left slow start at cwnd ${fmtNum(sv.cwnd)}`);
-  if (c.Timeouts > S.lastTimeouts) logEvent(name, 'timeout: back to slow start');
+  if (c.Timeouts > S.lastTimeouts) { logEvent(name, 'timeout: back to slow start'); markCut(t); }
+  // Copa only cuts on loss in competitive mode, by doubling δ.
+  if (cp.delta !== undefined) {
+    if (S.lastDelta !== undefined && S.lastDelta !== null && cp.mode === 'competitive' && S.lastMode === 'competitive' && cp.delta > S.lastDelta * 1.5) markCut(t);
+    S.lastDelta = cp.delta;
+  }
   if (c.CongestionEvents > S.lastEvents) {
+    markCut(t);
     logEvent(name, `congestion event ${c.CongestionEvents}: cwnd ${fmtNum(sv.cwnd)}, W_max ${fmtNum(cu.wMax)}, K ${fmtNum(cu.k)} s`);
   }
   S.lastMode = cp.mode ?? null; S.lastSlowStart = ctl.slowStart;
