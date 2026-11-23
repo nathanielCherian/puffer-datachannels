@@ -2,11 +2,12 @@
 
 // ---------------------------------------------------------------------------
 // The congestion-control page. The server sends junk as fast as a congestion
-// controller lets it, Copa (internal/copa) or CUBIC (internal/cubic); this
-// page is the receiver. It has two jobs:
+// controller lets it: Copa, CUBIC, BBR or Vegas (internal/copa and so on);
+// this page is the receiver. It has two jobs:
 //
-//   1. Acknowledge every DATA packet the moment it arrives. Both controllers
-//      are clocked by these acks and take an RTT sample from each one.
+//   1. Acknowledge every DATA packet: the moment it arrives, or in one
+//      message per interval (see flushAcks). The controllers are clocked by
+//      these acks and take an RTT sample from each packet.
 //   2. Measure what arrives: throughput, one-way delay, queueing delay, jitter,
 //      loss, reordering. Everything under "Measuring" is from the packets
 //      themselves and owes nothing to what the server says about itself.
@@ -27,27 +28,38 @@ const REPORT_MS = 200;
 const HIST_STEP_MS = 0.5, HIST_BUCKETS = 10000;
 
 // The delay and window charts show what the running controller has: Copa's
-// RTTstanding, velocity and 1/δ, or CUBIC's ssthresh and W_max.
+// RTTstanding, velocity and 1/δ, CUBIC's ssthresh and W_max, BBR's bandwidth
+// estimate and its bounds on what is in flight, Vegas's ssthresh and diff.
 //
 // The rate, delay and window charts also carry two kinds of vertical bar, so
 // that cause and effect can be read off the same time axis:
 //   loss   a packet this page never received, at the moment its absence
 //          showed (a later packet arrived in its place); see noteGaps
-//   cut    the sender reduced its window: a CUBIC congestion event, Copa
-//          (competitive) raising δ, or a timeout. From the sender's snapshots,
-//          so within 100 ms of when it happened.
+//   cut    the sender reduced its window: a CUBIC or Vegas congestion event,
+//          Copa (competitive) raising δ, BBR lowering one of its bounds after
+//          loss, or a timeout. From the sender's snapshots, so within 100 ms
+//          of when it happened.
+const NAMES = { copa: 'Copa', cubic: 'CUBIC', bbr: 'BBR', vegas: 'Vegas' };
 const MARKS = [
   { key: 'loss', name: 'loss (client)', color: '#d6336c' },
   { key: 'cut', name: 'sender cut its window', color: '#6b6b70', dash: [4, 3], width: 1.5 },
 ];
 function makeCharts(algorithm) {
-  const copa = algorithm !== 'cubic';
+  const copa = algorithm === 'copa', bbr = algorithm === 'bbr';
   const marks = { marks: MARKS };
+  const windowLines = {
+    copa: [{ key: 'velocity', name: 'velocity v' }, { key: 'invDelta', name: '1/δ' }],
+    cubic: [{ key: 'ssthresh', name: 'ssthresh' }, { key: 'wMax', name: 'W_max' }],
+    bbr: [{ key: 'bdp', name: 'BDP (bw · min_rtt)' }, { key: 'inflightLongterm', name: 'inflight_longterm' },
+      { key: 'inflightShortterm', name: 'inflight_shortterm' }],
+    vegas: [{ key: 'ssthresh', name: 'ssthresh' }, { key: 'diff', name: 'diff (packets queued)' }],
+  };
   return {
     rate: new Chart($('c-rate'), [
       { key: 'recv', name: 'received (client)' },
       { key: 'sent', name: 'sent' },
-      { key: 'window', name: copa ? 'cwnd / RTTstanding (λ)' : 'cwnd / smoothed RTT' },
+      { key: 'window', name: copa ? 'cwnd / RTTstanding (λ)' : bbr ? 'bandwidth estimate (bw)' : 'cwnd / smoothed RTT' },
+      ...(bbr ? [{ key: 'maxBw', name: 'max_bw' }, { key: 'pacing', name: 'pacing rate' }] : []),
     ], marks),
     delay: new Chart($('c-delay'), [
       { key: 'owd', name: 'one-way delay, mean (client)' },
@@ -60,8 +72,7 @@ function makeCharts(algorithm) {
     window: new Chart($('c-window'), [
       { key: 'cwnd', name: 'cwnd' },
       { key: 'inFlight', name: 'in flight' },
-      ...(copa ? [{ key: 'velocity', name: 'velocity v' }, { key: 'invDelta', name: '1/δ' }]
-        : [{ key: 'ssthresh', name: 'ssthresh' }, { key: 'wMax', name: 'W_max' }]),
+      ...(windowLines[algorithm] || []),
     ], marks),
     loss: new Chart($('c-loss'), [
       { key: 'client', name: 'missing sequence numbers (client)' },
@@ -99,7 +110,7 @@ function sendMedia(buf) {
 $('start').onclick = start;
 $('stop').onclick = () => stop('stopped');
 $('download').onclick = downloadCSV;
-const inputs = ['algorithm', 'maxRate', 'mode', 'delta', 'duration', 'stun'];
+const inputs = ['algorithm', 'maxRate', 'ackMs', 'mode', 'delta', 'duration', 'stun'];
 
 // Show the server's values where a blank field would use them.
 let serverAlgorithm = 'copa';
@@ -121,7 +132,8 @@ async function start() {
   const t = now();
   Object.assign(S, {
     t0: t, hello: null, server: null, serverAt: null, sessionId: null, logDir: null, rows: [],
-    recent: [], fbSeq: 0, acksSent: 0, ackErrors: 0,
+    recent: [], pending: [], prevBatch: [], ackMs: Number($('ackMs').value) > 0 ? Number($('ackMs').value) : 0,
+    fbSeq: 0, acksSent: 0, ackErrors: 0,
     pings: [], clock: null, pingId: 1, lastRttMs: null,
     // Totals for the run.
     n: { packets: 0, bytes: 0, late: 0, duplicates: 0, lossMarks: 0 },
@@ -129,7 +141,7 @@ async function start() {
     minTransit: Infinity, lastTransit: null, jitterMs: 0,
     hist: new Uint32Array(HIST_BUCKETS), histN: 0,
     seen: new Set(), lastMode: null, lastSlowStart: null, lastEvents: 0, lastTimeouts: 0, lastSpurious: 0,
-    capWarned: false, prevAcks: null, lastDelta: null,
+    capWarned: false, prevAcks: null, lastDelta: null, lastBbrState: null, lastBbrCuts: 0, lastTooHigh: 0,
     gaps: new Map(), // sequence numbers skipped over and not yet arrived -> when the skip showed
     // The interval being measured, and where the previous one ended.
     win: newWindow(t), prev: { packets: 0, expected: 0, serverLost: 0, serverResolved: 0 },
@@ -148,6 +160,7 @@ async function start() {
     ping();
     S.timers.push(setInterval(ping, 250));
     S.timers.push(setInterval(report, REPORT_MS));
+    if (S.ackMs > 0) S.timers.push(setInterval(flushAcks, S.ackMs));
   };
   S.media.onclose = () => { if (S.pc === pc) stop('media channel closed'); };
   // Reliable: the server's hello and snapshots, our measurements for its log.
@@ -171,7 +184,7 @@ async function start() {
         sdp: pc.localDescription.sdp, type: pc.localDescription.type, algorithm: $('algorithm').value || undefined,
         maxRate: mbps ? Math.round(mbps * 1e6) : undefined, mode: $('mode').value || undefined,
         delta: num('delta'), durationSec: num('duration'),
-        client: { userAgent: navigator.userAgent, timeOrigin: performance.timeOrigin, ackRepeat: ACK_REPEAT, reportMs: REPORT_MS },
+        client: { userAgent: navigator.userAgent, timeOrigin: performance.timeOrigin, ackRepeat: ACK_REPEAT, ackMs: S.ackMs, reportMs: REPORT_MS },
       }),
     });
     const body = await res.json();
@@ -221,8 +234,9 @@ function onCtrl(msg) {
   if (msg.type === 'hello') {
     S.hello = msg;
     const c = msg.cc;
-    logEvent('hello', (c.algorithm === 'cubic' ? 'CUBIC' : `Copa mode ${c.mode}, δ ${c.delta}`) +
-      `, at most ${c.maxRate / 1e6} Mbps, ${c.packetBytes}-byte packets` + (c.durationSec ? `, for ${c.durationSec} s` : ''));
+    logEvent('hello', (c.algorithm === 'copa' ? `Copa mode ${c.mode}, δ ${c.delta}` : NAMES[c.algorithm] || c.algorithm) +
+      `, at most ${c.maxRate / 1e6} Mbps, ${c.packetBytes}-byte packets` + (c.durationSec ? `, for ${c.durationSec} s` : '') +
+      (S.ackMs > 0 ? `, acks every ${S.ackMs} ms` : ', an ack per packet'));
   } else if (msg.type === 'server-stats') {
     onServerStats(msg.data);
   } else if (msg.type === 'closed') {
@@ -242,14 +256,38 @@ function onMedia(buf) {
   const seq = d.getUint32(2);
   const sendMs = Number(d.getBigInt64(6)) / 1000; // server clock
 
-  // The ack first: the sender's RTT sample should carry as little of this
-  // page's own time as possible. It names this arrival and the few before it,
-  // each with when it arrived, so the sender can subtract the hold exactly.
-  S.recent.push([seq, tRecv]);
-  if (S.recent.length > ACK_REPEAT) S.recent.shift();
-  if (sendMedia(Wire.feedback(S.fbSeq++, now(), S.recent))) S.acksSent++; else S.ackErrors++;
+  if (S.ackMs > 0) {
+    // Batched: flushAcks sends this arrival with the others of its interval.
+    S.pending.push([seq, tRecv]);
+  } else {
+    // The ack first: the sender's RTT sample should carry as little of this
+    // page's own time as possible. It names this arrival and the few before
+    // it, each with when it arrived, so the sender can subtract the hold
+    // exactly.
+    S.recent.push([seq, tRecv]);
+    if (S.recent.length > ACK_REPEAT) S.recent.shift();
+    if (sendMedia(Wire.feedback(S.fbSeq++, now(), S.recent))) S.acksSent++; else S.ackErrors++;
+  }
 
   measure(seq, sendMs, tRecv, buf.byteLength);
+}
+
+// Batched acks ("Acknowledge every" in Settings): one message per interval
+// instead of one per packet. It names every arrival of the interval with its
+// own arrival time, so the sender still gets an exact RTT sample for each
+// packet; what the sender loses is the timing, since a window's worth of
+// room now opens at once and the controller hears of congestion up to an
+// interval late. The interval before is named again, so one lost message
+// does not look like a run of lost packets.
+function flushAcks() {
+  if (!S.pending.length) return;
+  const batch = S.pending;
+  S.pending = [];
+  const all = S.prevBatch.concat(batch); // oldest first: the sender wants the newest last
+  for (let i = 0; i < all.length; i += Wire.MAX_FEEDBACK_ACKS) {
+    if (sendMedia(Wire.feedback(S.fbSeq++, now(), all.slice(i, i + Wire.MAX_FEEDBACK_ACKS)))) S.acksSent++; else S.ackErrors++;
+  }
+  S.prevBatch = batch;
 }
 
 // Clock offset, NTP style: the lowest-RTT ping of the last 10 s is the
@@ -381,10 +419,14 @@ function report() {
   S.prev.expected = expected; S.prev.packets = S.n.packets;
   const lossPct = due > 0 ? 100 * Math.max(0, 1 - got / due) : (got > 0 ? 0 : null);
 
-  // ctl is the controller's own state; cp and cu are it by name, one of them
-  // empty, so that a row has the same columns whichever is running.
+  // ctl is the controller's own state; cp, cu, bb and vg are it by name, all
+  // but one of them empty, so that a row has the same columns whichever is
+  // running.
   const sv = S.server || {}, ctl = sv[sv.algorithm] || {}, cp = sv.copa || {}, cu = sv.cubic || {};
+  const bb = sv.bbr || {}, vg = sv.vegas || {};
   const mbps = (bps) => (bps === undefined || bps === null ? null : bps / 1e6);
+  // A controller's rate in packets per second, as Mbps of DataChannel messages.
+  const pps = (v) => (v === undefined || v === null ? null : v * (sv.packetBytes || 1150) * 8 / 1e6);
   const row = {
     tSec: round((t - S.t0) / 1000), algorithm: sv.algorithm ?? null,
     // Client: measured here.
@@ -403,9 +445,18 @@ function report() {
     velocity: cp.velocity ?? null, delta: round(cp.delta, 4), mode: cp.mode ?? null,
     rttStandingMs: round(cp.rttStandingMs), copaQueueMs: round(cp.queueDelayMs), targetMbps: round(mbps(sv.targetBitrate)),
     // CUBIC only.
-    cubicState: cu.state ?? null, ssthresh: round(cu.ssthresh), wMax: round(cu.wMax), cubicK: round(cu.k),
-    congestionEvents: cu.counters ? cu.counters.CongestionEvents : null,
-    appLimitedAcks: cu.counters ? cu.counters.AppLimitedAcks : null,
+    cubicState: cu.state ?? null, ssthresh: round(cu.ssthresh ?? vg.ssthresh), wMax: round(cu.wMax), cubicK: round(cu.k),
+    congestionEvents: ctl.counters ? ctl.counters.CongestionEvents ?? null : null,
+    appLimitedAcks: ctl.counters ? ctl.counters.AppLimitedAcks ?? null : null,
+    // BBR only. Rates as Mbps, like the others.
+    bbrState: bb.state ?? null, bwMbps: round(pps(bb.bw)), maxBwMbps: round(pps(bb.maxBw)), bwShorttermMbps: round(pps(bb.bwShortterm)),
+    bdp: round(bb.bdp), inflightLongterm: round(bb.inflightLongterm), inflightShortterm: round(bb.inflightShortterm),
+    pacingGain: bb.pacingGain ?? null, cwndGain: bb.cwndGain ?? null, extraAcked: round(bb.extraAcked),
+    bbrRound: bb.round ?? null, bbrProbes: bb.counters ? bb.counters.BwProbes : null,
+    bbrProbeRTTs: bb.counters ? bb.counters.ProbeRTTs : null,
+    bbrTooHigh: bb.counters ? bb.counters.InflightTooHigh : null, bbrLossRounds: bb.counters ? bb.counters.LossRounds : null,
+    // Vegas only.
+    vegasState: vg.state ?? null, vegasDiff: round(vg.diff),
     // Loss detection, either controller.
     srvLost: sv.counters ? sv.counters.Lost : null, srvSpurious: sv.counters ? sv.counters.Spurious : null,
     reorderWindowMs: round(sv.reorderWindowMs),
@@ -420,10 +471,50 @@ function report() {
   for (const c of Object.values(charts)) c.draw(t);
 
   const srv = sv.counters || {};
-  const cubic = sv.algorithm === 'cubic';
+  const alg = sv.algorithm;
   let state = '–';
-  if (cubic) state = `CUBIC, ${cu.state}`;
+  if (alg === 'cubic') state = `CUBIC, ${cu.state}`;
+  else if (alg === 'bbr') state = `BBR, ${bb.state}`;
+  else if (alg === 'vegas') state = `Vegas, ${vg.state}`;
   else if (cp.cwnd !== undefined) state = `Copa, ${cp.mode}${cp.slowStart ? ', slow start' : ''}`;
+  const share = (n, of) => (of ? 100 * n / of : null);
+  const inf = (v) => (v === undefined || v === null ? '∞' : v);
+  const own = {
+    cubic: () => [
+      ['ssthresh', inf(cu.ssthresh), 'pkts'],
+      ['W_max', cu.wMax, 'pkts'],
+      ['K', cu.k, `s · ${fmtNum(cu.epochSec)} s into the epoch`],
+      ['congestion events', cu.counters.CongestionEvents, `· ${cu.counters.FastConvergences} fast conv.`],
+      ['Reno-friendly acks', share(cu.counters.RenoFriendlyAcks, cu.counters.Acks), '%'],
+      ['acks with the window not full', share(cu.counters.AppLimitedAcks, cu.counters.Acks), '%'],
+    ],
+    bbr: () => [
+      ['bandwidth estimate (bw)', pps(bb.bw), `Mbps · max_bw ${fmtNum(pps(bb.maxBw))}`],
+      ['bw_shortterm', inf(pps(bb.bwShortterm)), 'Mbps'],
+      ['gains: pacing / cwnd', `${fmtNum(bb.pacingGain)} / ${fmtNum(bb.cwndGain)}`, ''],
+      ['BDP', bb.bdp, `pkts · ${fmtNum(bb.extraAcked)} extra acked`],
+      ['inflight_longterm', inf(bb.inflightLongterm), 'pkts'],
+      ['inflight_shortterm', inf(bb.inflightShortterm), 'pkts'],
+      ['bandwidth probes', bb.counters.BwProbes, `· ${bb.counters.InflightTooHigh} met high loss`],
+      ['ProbeRTTs', bb.counters.ProbeRTTs, `· round ${bb.round}`],
+      ['rounds with loss outside a probe', bb.counters.LossRounds, ''],
+      ['acks while the cap was the limit', share(bb.counters.AppLimitedAcks, bb.counters.Acks), '%'],
+    ],
+    vegas: () => [
+      ['diff (packets queued)', vg.diff, `pkts · kept within ${vg.alpha}..${vg.beta}`],
+      ['ssthresh', inf(vg.ssthresh), 'pkts'],
+      ['rounds: grew / shrank / held', `${vg.counters.Increases} / ${vg.counters.Decreases} / ${vg.counters.Holds}`, ''],
+      ['congestion events (loss)', vg.counters.CongestionEvents, ''],
+      ['acks with the window not full', share(vg.counters.AppLimitedAcks, vg.counters.Acks), '%'],
+    ],
+    copa: () => [
+      ['RTTstanding', cp.rttStandingMs, 'ms'],
+      ['Copa queueing delay', cp.queueDelayMs, 'ms'],
+      ['target rate λt', mbps(sv.targetBitrate) === null ? '∞' : mbps(sv.targetBitrate), 'Mbps'],
+      ['velocity', cp.velocity, ''],
+      ['δ', cp.delta, ''],
+    ],
+  };
   $('tiles').innerHTML = tilesHTML([
     ['received · client', row.recvMbps, 'Mbps'],
     ['mean since start · client', total.meanMbps, 'Mbps'],
@@ -441,24 +532,11 @@ function report() {
     ['smoothed RTT', sv.srttMs, 'ms'],
     ['RTTmin', ctl.rttMinMs, 'ms'],
     ['pacing rate', mbps(sv.pacingBitrate), 'Mbps'],
-    ...(cubic ? [
-      ['ssthresh', cu.ssthresh === undefined ? '∞' : cu.ssthresh, 'pkts'],
-      ['W_max', cu.wMax, 'pkts'],
-      ['K', cu.k, `s · ${fmtNum(cu.epochSec)} s into the epoch`],
-      ['congestion events', cu.counters.CongestionEvents, `· ${cu.counters.FastConvergences} fast conv.`],
-      ['Reno-friendly acks', cu.counters.Acks ? 100 * cu.counters.RenoFriendlyAcks / cu.counters.Acks : null, '%'],
-      ['acks with the window not full', cu.counters.Acks ? 100 * cu.counters.AppLimitedAcks / cu.counters.Acks : null, '%'],
-    ] : [
-      ['RTTstanding', cp.rttStandingMs, 'ms'],
-      ['Copa queueing delay', cp.queueDelayMs, 'ms'],
-      ['target rate λt', mbps(sv.targetBitrate) === null ? '∞' : mbps(sv.targetBitrate), 'Mbps'],
-      ['velocity', cp.velocity, ''],
-      ['δ', cp.delta, ''],
-    ]),
+    ...(ctl.counters && own[alg] ? own[alg]() : []),
     ['declared lost', srv.Lost, `pkts · ${srv.TimedOut || 0} by timeout · ${srv.Spurious || 0} only late`],
     ['reordering window', sv.reorderWindowMs, 'ms'],
     ['ping RTT · client', row.pingRttMs, 'ms'],
-    ['acks sent · client', S.acksSent, ''],
+    ['acks sent · client', S.acksSent, S.ackMs > 0 ? `· one per ${S.ackMs} ms` : '· one per packet'],
     ['SCTP buffered', sv.sctpBufferedBytes, 'bytes'],
   ]);
   $('t-client').textContent = JSON.stringify({ interval: row, totals: total }, null, 1);
@@ -470,15 +548,22 @@ function onServerStats(sv) {
   const t = now();
   S.server = sv; S.serverAt = t;
   const name = sv.algorithm, ctl = sv[name] || {}, cp = sv.copa || {}, cu = sv.cubic || {};
+  const bb = sv.bbr || {}, vg = sv.vegas || {};
   const mbps = (bps) => (bps === undefined || bps === null ? null : bps / 1e6);
+  const pps = (v) => (v === undefined || v === null ? null : v * (sv.packetBytes || 1150) * 8 / 1e6);
   // Copa's target rate λt is a tile, not a line: it is 1/(δ·dq), so it shoots
   // off the scale every time the queue empties.
-  charts.rate.push(t, { sent: mbps(sv.sendBitrate), window: mbps(sv.windowBitrate) });
+  charts.rate.push(t, {
+    sent: mbps(sv.sendBitrate), window: mbps(sv.windowBitrate),
+    maxBw: pps(bb.maxBw), pacing: name === 'bbr' ? mbps(sv.pacingBitrate) : null,
+  });
   charts.delay.push(t, { standing: cp.rttStandingMs, rttMin: ctl.rttMinMs, srtt: sv.srttMs });
   charts.window.push(t, {
     cwnd: sv.cwnd, inFlight: sv.inFlight,
     velocity: cp.velocity, invDelta: cp.delta ? 1 / cp.delta : null,
-    ssthresh: cu.ssthresh, wMax: cu.wMax || null,
+    ssthresh: cu.ssthresh ?? vg.ssthresh, wMax: cu.wMax || null,
+    bdp: bb.bdp || null, inflightLongterm: bb.inflightLongterm, inflightShortterm: bb.inflightShortterm,
+    diff: vg.diff,
   });
   charts.loss.push(t, { server: sv.lossPct ?? 0 });
   $('t-server').textContent = JSON.stringify(sv, null, 1);
@@ -486,7 +571,22 @@ function onServerStats(sv) {
   const c = ctl.counters || {};
   if (S.lastMode !== null && cp.mode !== undefined && cp.mode !== S.lastMode) logEvent(name, `mode ${S.lastMode} → ${cp.mode}`);
   if (S.lastSlowStart === true && ctl.slowStart === false && !(c.CongestionEvents > 0)) logEvent(name, `left slow start at cwnd ${fmtNum(sv.cwnd)}`);
-  if (c.Timeouts > S.lastTimeouts) { logEvent(name, 'timeout: back to slow start'); markCut(t); }
+  if (c.Timeouts > S.lastTimeouts) { logEvent(name, name === 'bbr' ? 'timeout: window collapsed' : 'timeout: back to slow start'); markCut(t); }
+  // BBR: changes of state, and loss lowering one of its bounds.
+  if (name === 'bbr') {
+    // ProbeBW's phases come round every few seconds; the others are news.
+    const quiet = (st) => /^ProbeBW/.test(st || '');
+    if (S.lastBbrState && bb.state !== S.lastBbrState && !(quiet(bb.state) && quiet(S.lastBbrState))) {
+      logEvent(name, `${S.lastBbrState} → ${bb.state}: bw ${fmtNum(pps(bb.bw))} Mbps, min_rtt ${fmtNum(bb.rttMinMs)} ms, cwnd ${fmtNum(sv.cwnd)}`);
+    }
+    S.lastBbrState = bb.state;
+    const cuts = (c.InflightTooHigh || 0) + (c.LossRounds || 0);
+    if (cuts > S.lastBbrCuts) {
+      markCut(t);
+      if (c.InflightTooHigh > S.lastTooHigh) logEvent(name, `loss while probing: inflight_longterm ${fmtNum(bb.inflightLongterm)} pkts`);
+    }
+    S.lastBbrCuts = cuts; S.lastTooHigh = c.InflightTooHigh || 0;
+  }
   // Copa only cuts on loss in competitive mode, by doubling δ.
   if (cp.delta !== undefined) {
     if (S.lastDelta !== undefined && S.lastDelta !== null && cp.mode === 'competitive' && S.lastMode === 'competitive' && cp.delta > S.lastDelta * 1.5) markCut(t);
@@ -494,26 +594,28 @@ function onServerStats(sv) {
   }
   if (c.CongestionEvents > S.lastEvents) {
     markCut(t);
-    logEvent(name, `congestion event ${c.CongestionEvents}: cwnd ${fmtNum(sv.cwnd)}, W_max ${fmtNum(cu.wMax)}, K ${fmtNum(cu.k)} s`);
+    logEvent(name, `congestion event ${c.CongestionEvents}: cwnd ${fmtNum(sv.cwnd)}` +
+      (name === 'cubic' ? `, W_max ${fmtNum(cu.wMax)}, K ${fmtNum(cu.k)} s` : ''));
   }
   S.lastMode = cp.mode ?? null; S.lastSlowStart = ctl.slowStart;
   const spurious = (sv.counters || {}).Spurious || 0;
   if (spurious > S.lastSpurious) {
     logEvent('loss detection', `${spurious - S.lastSpurious} packet(s) declared lost arrived after all: reordering window now ${fmtNum(sv.reorderWindowMs)} ms`);
   }
-  // CUBIC only probes when its window is what limits it. If most acks find
+  // CUBIC and Vegas only probe when the window is what limits them. If most acks find
   // the window not full, the rate cap (or the sender itself) is the limit and
   // there will be no sawtooth to see: say so, once.
-  if (name === 'cubic' && S.prevAcks && c.Acks - S.prevAcks.acks > 200 && !S.capWarned && sv.uptimeSec > 3) {
+  const windowed = name === 'cubic' || name === 'vegas';
+  if (windowed && S.prevAcks && c.Acks - S.prevAcks.acks > 200 && !S.capWarned && sv.uptimeSec > 3) {
     const share = (c.AppLimitedAcks - S.prevAcks.limited) / (c.Acks - S.prevAcks.acks);
     if (share > 0.8) {
       S.capWarned = true;
       const cap = S.hello ? `${S.hello.cc.maxRate / 1e6} Mbps` : 'the cap';
-      logEvent('cubic', `the window is not the limit: the path carries the rate cap (${cap}) without filling it, so CUBIC is not probing. ` +
+      logEvent(name, `the window is not the limit: the path carries the rate cap (${cap}) without filling it, so ${NAMES[name]} is not probing. ` +
         'A bottleneck below the cap (or a higher cap) is needed to see it work');
     }
   }
-  if (name === 'cubic' && (!S.prevAcks || c.Acks - S.prevAcks.acks > 200)) S.prevAcks = { acks: c.Acks, limited: c.AppLimitedAcks };
+  if (windowed && (!S.prevAcks || c.Acks - S.prevAcks.acks > 200)) S.prevAcks = { acks: c.Acks, limited: c.AppLimitedAcks };
   S.lastEvents = c.CongestionEvents || 0; S.lastTimeouts = c.Timeouts || 0; S.lastSpurious = spurious;
 }
 

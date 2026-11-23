@@ -174,7 +174,8 @@ func main() {
 		resp, err := mgr.HandleOffer(r.Context(), req, r.RemoteAddr)
 		writeOfferResponse(w, r, resp, err)
 	})
-	// The congestion-control page (web/cc.html): junk data under Copa or CUBIC.
+	// The congestion-control page (web/cc.html): junk data under Copa, CUBIC,
+	// BBR or Vegas.
 	mux.HandleFunc("POST /cc/offer", func(w http.ResponseWriter, r *http.Request) {
 		var req session.CCRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {

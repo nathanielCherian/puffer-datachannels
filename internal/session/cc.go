@@ -12,21 +12,24 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"puffer-datachannels/internal/bbr"
 	"puffer-datachannels/internal/copa"
 	"puffer-datachannels/internal/cubic"
 	"puffer-datachannels/internal/logs"
+	"puffer-datachannels/internal/vegas"
 	"puffer-datachannels/internal/wire"
 )
 
 // A congestion-control (cc) session is the transport on its own: no ffmpeg,
 // no encoder, no retransmission. The server always has data (junk) to send,
-// and a congestion controller, Copa (internal/copa) or CUBIC (internal/cubic),
-// decides how much of it goes out. The channel and the DATA format are the
+// and a congestion controller (Copa, CUBIC, BBR or Vegas, each in its own
+// package under internal) decides how much of it goes out. The channel and the DATA format are the
 // ones media uses, so everything said about SCTP in Settings holds here too;
 // the differences are on the return path:
 //
-//   - The browser acknowledges every packet the moment it arrives, instead of
-//     reporting every 50 ms. Both controllers are clocked by acks: a packet
+//   - The browser acknowledges every packet the moment it arrives (or, if the
+//     page is set to, all of an interval's arrivals in one message), instead
+//     of reporting every 50 ms. The controllers are clocked by acks: a packet
 //     may only leave when one comes back, and each ack is an RTT sample.
 //   - An ack is a FEEDBACK message naming the last few arrivals, the newest
 //     last, so a lost ack is covered by the next ones. An arrival's RTT is
@@ -52,11 +55,25 @@ type controller interface {
 	SRTT() time.Duration
 }
 
+// sendObserver is for a controller that must also know of every packet as it
+// leaves (BBR: a delivery-rate sample needs what had been delivered by then).
+// now is the sentAt that OnAck or OnLoss will later be given for the packet.
+type sendObserver interface {
+	OnSend(now time.Time)
+}
+
 // Algorithms lists the congestion controllers a session can run.
-func Algorithms() []string { return []string{"copa", "cubic"} }
+func Algorithms() []string { return []string{"copa", "cubic", "bbr", "vegas"} }
 
 // ValidAlgorithm reports whether name is one of Algorithms.
-func ValidAlgorithm(name string) bool { return name == "copa" || name == "cubic" }
+func ValidAlgorithm(name string) bool {
+	for _, a := range Algorithms() {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
 
 // CCRequest is the body of POST /cc/offer. Zero fields take the server's
 // values (--cc-algorithm, --cc-max-rate, --cc-max-duration, --copa-mode,
@@ -64,7 +81,7 @@ func ValidAlgorithm(name string) bool { return name == "copa" || name == "cubic"
 type CCRequest struct {
 	SDP         string          `json:"sdp"`
 	Type        string          `json:"type"`
-	Algorithm   string          `json:"algorithm,omitempty"`   // copa, cubic
+	Algorithm   string          `json:"algorithm,omitempty"`   // copa, cubic, bbr, vegas
 	MaxRate     int             `json:"maxRate,omitempty"`     // bps of DataChannel messages; at most the server's
 	Mode        string          `json:"mode,omitempty"`        // Copa: default, auto, competitive
 	Delta       float64         `json:"delta,omitempty"`       // Copa: δ in default mode
@@ -274,6 +291,10 @@ func (s *CCSession) run(dc *webrtc.DataChannel) {
 	switch s.params.Algorithm {
 	case "cubic":
 		cc = cubic.New(cubic.Config{MaxRate: maxRate})
+	case "bbr":
+		cc = bbr.New(bbr.Config{MaxRate: maxRate})
+	case "vegas":
+		cc = vegas.New(vegas.Config{MaxRate: maxRate})
 	default:
 		cc = copa.New(copa.Config{Delta: s.params.Delta, Mode: s.params.Mode, MaxRate: maxRate})
 	}
@@ -474,6 +495,9 @@ func (s *junkSender) sendLocked(now time.Time) {
 	}
 	cwnd := s.cc.Cwnd()
 	s.sent[seq] = junkPacket{at: now, cwnd: cwnd}
+	if o, ok := s.cc.(sendObserver); ok {
+		o.OnSend(now)
+	}
 	s.c.Packets++
 	s.c.Bytes += int64(len(buf))
 	if s.logPkts {
@@ -491,6 +515,12 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.c.Feedbacks++
+	// Was the window what held the sender back just now? Two packets of
+	// slack: the pacer releases packets a moment after the acks that make
+	// room for them. Decided once for the message: when the page batches its
+	// acks, the later ones of a batch would otherwise find the room the
+	// earlier ones had just made.
+	windowFull := float64(len(s.sent)) >= s.cc.Cwnd()-2
 	for _, a := range fb.Acks {
 		p, ok := s.sent[a.Seq]
 		if !ok {
@@ -508,10 +538,6 @@ func (s *junkSender) onFeedback(b []byte, arrival time.Time) {
 			}
 			continue
 		}
-		// Was the window what held the sender back just now? Two packets of
-		// slack: the pacer releases packets a moment after the acks that make
-		// room for them.
-		windowFull := float64(len(s.sent)) >= s.cc.Cwnd()-2
 		delete(s.sent, a.Seq)
 		// How long the browser held the arrival before this message left: next
 		// to nothing for the newest, one or more packet intervals for repeats.
@@ -616,6 +642,15 @@ func (s *junkSender) snapshot() (map[string]any, junkCounters) {
 	case *cubic.Cubic:
 		st := cc.Stats(time.Now())
 		snap["algorithm"], snap["cubic"] = "cubic", st
+		snap["windowBitrate"] = bps(st.CurrentRate)
+	case *bbr.BBR:
+		// BBR's rate comes from its bandwidth estimate, not its window.
+		st := cc.Stats()
+		snap["algorithm"], snap["bbr"] = "bbr", st
+		snap["windowBitrate"] = bps(st.CurrentRate)
+	case *vegas.Vegas:
+		st := cc.Stats()
+		snap["algorithm"], snap["vegas"] = "vegas", st
 		snap["windowBitrate"] = bps(st.CurrentRate)
 	}
 	return snap, s.c

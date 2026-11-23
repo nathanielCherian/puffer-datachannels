@@ -46,7 +46,7 @@ also be set as `PUFFER_<FLAG>`.
 | `--sctp-min-cwnd` | 64 MiB | floor for SCTP's congestion window; 0 leaves SCTP congestion control on |
 | `--emulate-loss`, `--emulate-delay` | 0 | testing: drop a fraction of outgoing media packets / hold every outgoing packet |
 | `--emulate-rate`, `--emulate-queue` | 0, 200ms | testing: a bottleneck of this many bps for everything the server sends, with a drop-tail buffer this long |
-| `--cc-algorithm` | `copa` | the congestion-control page: `copa` or `cubic` when the page does not choose |
+| `--cc-algorithm` | `copa` | the congestion-control page: `copa`, `cubic`, `bbr` or `vegas` when the page does not choose |
 | `--cc-max-rate`, `--cc-max-duration` | 20000000, 10m | the congestion-control page: the most a session may send, and for how long |
 | `--copa-mode`, `--copa-delta` | `default`, 0.5 | Copa: how δ is chosen, and δ |
 
@@ -64,6 +64,17 @@ the sender here (`session.Settings`, and the channel options in `web/app.js`):
 - **Congestion control:** `SetSCTPMinCwnd(64 MiB)`. Pion never lets cwnd fall
   below the floor, so slow start, halving on loss and the collapse on a
   timeout do nothing, and `Send` goes straight to the wire.
+
+- **FORWARD-TSN:** `third_party/sctp` is pion/sctp v1.11.3 with one change
+  (`go.mod` replaces the module with it; the change is marked
+  "puffer-datachannels patch" in `association.go`). Upstream sends a
+  FORWARD-TSN for every SACK that leaves abandoned chunks unacknowledged,
+  which on this channel is every SACK; the browser answers each with an
+  immediate SACK, and the two trade packets for as long as data flows:
+  measured at 5,000 FORWARD-TSNs a second beside 280 data packets, half of a
+  5 Mbps link. The copy sends one only when a SACK reports a gap (the browser
+  is missing a chunk that will not be resent), and at most every 20 ms:
+  none at all on a path without loss.
 
 Still there: the browser's receive window (only matters if the page stops
 reading), SACKs on the uplink, and the browser's own SCTP congestion control
@@ -103,14 +114,16 @@ old). Arrival times are on the browser's clock: use differences. Audio packets
 (`SentPacket.Audio`) share the sequence numbers and the pacer, and leave ahead
 of video.
 
-## Congestion control: Copa and CUBIC
+## Congestion control: Copa, CUBIC, BBR and Vegas
 
 `/cc.html` is the transport without the media: the server sends random bytes
 as fast as a congestion controller allows, and the page acknowledges and
 measures them. The controller is chosen on the page:
 [Copa](https://www.usenix.org/conference/nsdi18/presentation/arun) (Arun and
-Balakrishnan, NSDI 2018), delay-based, or CUBIC
-([RFC 9438](https://www.rfc-editor.org/rfc/rfc9438)), loss-based. Same
+Balakrishnan, NSDI 2018), delay-based; CUBIC
+([RFC 9438](https://www.rfc-editor.org/rfc/rfc9438)), loss-based; BBR version 3
+([draft-ietf-ccwg-bbr-07](https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/)),
+model-based; or TCP Vegas (Brakmo and Peterson, 1995), delay-based. Same
 `media` channel, same DATA format, same SCTP settings as above; no ffmpeg, no
 encoder, no retransmission.
 
@@ -121,8 +134,8 @@ encoder, no retransmission.
 
 Without `--emulate-rate` (or a real bottleneck) there is nothing for a
 controller to find, and it sends at `--cc-max-rate`. That goes for a deployed
-server too: on a path that carries the cap without queueing, both controllers
-sit at the cap, and CUBIC in particular shows no sawtooth, because it only
+server too: on a path that carries the cap without queueing, every controller
+sits at the cap, and CUBIC in particular shows no sawtooth, because it only
 probes while its window is what limits it. The page says so in Events when
 that is the case. To see CUBIC work there, give it a bottleneck below the cap
 (`--emulate-rate`) or a cap above what the path carries. The emulated link is
@@ -151,8 +164,47 @@ defines none. While the window is not full (the sender is held by the rate
 cap) nothing moves: not the window, not the Reno estimate, not the epoch's
 clock (§5.8, §4.2). Left out: HyStart++ and the undo of spurious reductions.
 
-**The sender** is `internal/session/cc.go`, the same for both: anything with
-the six methods of its `controller` interface can drive it. A packet leaves
+**BBR** is `internal/bbr`, version 3 as in draft-ietf-ccwg-bbr-07, with the
+draft's function names. Every ack gives a delivery-rate sample (§4.1); the
+largest of the last two ProbeBW cycles is `max_bw`, the smallest RTT of the
+last 10 s is `min_rtt`, and the flow paces at `pacing_gain · bw` with at most
+`cwnd_gain · bw · min_rtt` (plus an allowance for aggregated acks) in flight.
+The state machine is the draft's: Startup (2.77×) until the rate stops
+growing by a quarter for three rounds or loss is high; Drain; then ProbeBW's
+DOWN, CRUISE, REFILL and UP, probing every 2 to 3 s or as often as Reno would
+recover; ProbeRTT for 200 ms when `min_rtt` is 10 s old. Loss above 2% while
+probing sets `inflight_longterm`, a round with loss outside a probe lowers
+`bw_shortterm` and `inflight_shortterm` by at most 0.7×, and a probe that
+follows one that met loss stops at the ceiling (precautionary probing). BBR
+is the one controller that is told of every packet sent (`OnSend`), which a
+delivery-rate sample needs. Under the rate cap its samples are marked
+application limited. Left out: the send quantum and offload budget,
+restarting from idle, ECN, and the undo of a spurious recovery. One line is
+Linux's rather than the draft's and is marked: after a timeout the short-term
+bound starts from the window before the collapse.
+
+**Vegas** is `internal/vegas`. `baseRTT` is the smallest RTT ever seen; once
+per round trip `diff = cwnd · (rtt − baseRTT) / rtt`, with `rtt` the round's
+smallest, estimates how many of the flow's packets are queued, and the window
+grows by one below α = 2, shrinks by one above β = 4, and holds in between.
+Slow start doubles every other round, as in the paper, and ends when diff
+passes γ = 1; loss halves the window, once per window of losses. Constants,
+the Reno fallback for a round with too few samples and the pacing are
+Linux's. Like CUBIC, it does not grow a window that is not full.
+
+**Acks.** By default the page acknowledges each packet as it arrives. With
+"Acknowledge every N ms" in Settings it sends one message per interval naming
+every arrival of the interval and its arrival time (and the interval before
+again, against a lost message), so each packet still gives an exact RTT
+sample and the uplink carries a tenth of the packets or fewer. The cost is
+timing: room in the window opens a batch at a time and the controller hears
+of queueing up to an interval late. At 20 ms on the link below, throughput
+was unchanged for all four; Copa's median queueing delay went from 5 to
+10 ms.
+
+**The sender** is `internal/session/cc.go`, the same for all four: anything
+with the six methods of its `controller` interface can drive it (and may also
+implement `OnSend`). A packet leaves
 when fewer than cwnd are unacknowledged and the pacer's budget allows.
 
 A packet is lost once three sent after it are acknowledged and one of those
@@ -179,12 +231,14 @@ time above the lowest seen, which needs no clock offset) with p50/p95/p99;
 RFC 3550 jitter; the longest gap between arrivals. Beside these it shows the
 sender's state from its 100 ms snapshots: cwnd, packets in flight, RTTmin,
 smoothed RTT, pacing rate, and the controller's own (Copa: RTTstanding, δ,
-velocity, mode, target rate; CUBIC: ssthresh, W_max, K, congestion events).
+velocity, mode, target rate; CUBIC: ssthresh, W_max, K, congestion events;
+BBR: state, bw and max_bw, the gains, BDP, the long- and short-term bounds;
+Vegas: diff, ssthresh, what each round decided).
 The rate, delay and window charts mark two kinds of moment with vertical
 bars: a loss, at the time the page saw a later packet arrive in a missing
 one's place (drawn once the missing one has had 300 ms to turn up late), and
-the sender cutting its window (a CUBIC congestion event, Copa in competitive
-mode raising δ, or a timeout). Each interval is a
+the sender cutting its window (a CUBIC or Vegas congestion event, Copa in
+competitive mode raising δ, BBR lowering a bound after loss, or a timeout). Each interval is a
 row in "Download metrics (CSV)" and a `stats` line in the session's
 `client.jsonl`; `cc.jsonl` has every packet (`sent`, `ack` with its RTT,
 `lost`).
