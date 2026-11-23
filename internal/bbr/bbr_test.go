@@ -52,7 +52,12 @@ type sim struct {
 	l       *link
 	flows   []*flow
 	measure time.Duration
-	onTick  func(t time.Duration, now time.Time)
+	// clump is how often acks reach the sender (0 = as they are due). Those
+	// that came due in between arrive together, at one instant, and the
+	// sender may send between any two of them, as the real one does: its
+	// send loop is woken by every ack.
+	clump  time.Duration
+	onTick func(t time.Duration, now time.Time)
 }
 
 func (s *sim) run(d time.Duration) {
@@ -70,9 +75,25 @@ func (s *sim) run(d time.Duration) {
 			if t < f.startAt {
 				continue
 			}
+			send := func() {
+				for f.budget >= 0 && float64(len(f.inFlight)+1) <= f.cc.Cwnd() {
+					f.budget--
+					p := pending{sentAt: now}
+					ackAt, ok := s.l.send(now)
+					if !ok {
+						// The sender learns of a loss about when the ack would have come.
+						p.lost, ackAt = true, s.l.free.Add(s.l.prop)
+					}
+					p.ackAt = ackAt
+					f.inFlight = append(f.inFlight, p)
+					f.sentWin++
+					f.cc.OnSend(now)
+				}
+			}
+			f.budget = math.Min(f.budget+step.Seconds()*f.cc.PacingRate(), 2)
 			// Acks are in the order the packets left, losses included, so the
 			// head of the queue is always the next to be heard of.
-			for len(f.inFlight) > 0 && !f.inFlight[0].ackAt.After(now) {
+			for (s.clump == 0 || t%s.clump == 0) && len(f.inFlight) > 0 && !f.inFlight[0].ackAt.After(now) {
 				p := f.inFlight[0]
 				full := float64(len(f.inFlight)) >= f.cc.Cwnd()-2
 				f.inFlight = f.inFlight[1:]
@@ -83,21 +104,11 @@ func (s *sim) run(d time.Duration) {
 				}
 				f.ackedWin++
 				f.cc.OnAck(now, p.sentAt, p.ackAt.Sub(p.sentAt), 0, full)
-			}
-			f.budget = math.Min(f.budget+step.Seconds()*f.cc.PacingRate(), 2)
-			for f.budget >= 0 && float64(len(f.inFlight)+1) <= f.cc.Cwnd() {
-				f.budget--
-				p := pending{sentAt: now}
-				ackAt, ok := s.l.send(now)
-				if !ok {
-					// The sender learns of a loss about when the ack would have come.
-					p.lost, ackAt = true, s.l.free.Add(s.l.prop)
+				if s.clump > 0 {
+					send()
 				}
-				p.ackAt = ackAt
-				f.inFlight = append(f.inFlight, p)
-				f.sentWin++
-				f.cc.OnSend(now)
 			}
+			send()
 		}
 		if s.onTick != nil {
 			s.onTick(t, now)
@@ -228,6 +239,33 @@ func TestFindsARateIncrease(t *testing.T) {
 	t.Logf("utilisation of the doubled link %.3f, bw %.0f", util, f.cc.Stats().Bw)
 	if util < 0.9 {
 		t.Errorf("utilisation %.3f ten seconds after the rate doubled, want at least 0.9", util)
+	}
+}
+
+// Acks that reach the sender in clumps, a millisecond's worth at one instant,
+// with the sender sending between them. A packet sent in the middle of a
+// clump must not take "delivered so far" and "as of now" from there: the rest
+// of the clump is about to be counted as delivered after it left, in no time
+// at all. On a 6 ms path that made every sample up to a sixth too high.
+func TestClumpedAcksDoNotOverestimate(t *testing.T) {
+	l := &link{rate: 5000, prop: 6 * time.Millisecond, buffer: 400}
+	f := &flow{cc: newBBR(10, Config{})}
+	s := &sim{l: l, flows: []*flow{f}, measure: 3 * time.Second, clump: time.Millisecond}
+	worst := 0.0
+	s.onTick = func(d time.Duration, _ time.Time) {
+		if d >= s.measure {
+			worst = math.Max(worst, f.cc.maxBw)
+		}
+	}
+	const dur = 20 * time.Second
+	s.run(dur)
+	util := float64(f.ackedWin) / (l.rate * (dur - s.measure).Seconds())
+	t.Logf("utilisation %.3f, largest max_bw %.0f packets/s, mean queue %.1f packets", util, worst, s.meanQueue())
+	if worst > 1.03*l.rate {
+		t.Errorf("max_bw reached %.0f packets/s on a link of %.0f", worst, l.rate)
+	}
+	if util < 0.9 {
+		t.Errorf("utilisation %.3f, want at least 0.9", util)
 	}
 }
 

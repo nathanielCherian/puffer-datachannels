@@ -108,16 +108,44 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
+// deliveryState is one moment of the connection's delivery record: how many
+// packets had been delivered, when the last of them was acknowledged, and
+// when that packet had been sent. A rate sample is the difference between two
+// of these (§4.1.2).
+//
+// The three only belong together between acks that arrive apart. Acks often
+// arrive in clumps (a timer that fires every millisecond somewhere on the
+// path, the browser handing over several messages at once), and this sender
+// sends between the acks of a clump. A packet that leaves in the middle of
+// one would record the count so far with the time of the clump, and the rest
+// of the clump, delivered before it left, would then be counted as delivered
+// during its flight in no time at all: every such sample is up to a clump too
+// high, and max_bw keeps the highest. So while acks are arriving less than
+// clumpGap apart, packets record the state from before the clump began
+// (BBR.settled). That sample is over a slightly longer interval and is never
+// too high for this reason. If acks never pause for clumpGap, which is what a
+// fast flow looks like, the settled state is renewed every maxSettledAge
+// regardless, and the protection is lost rather than the samples going stale.
+type deliveryState struct {
+	delivered     int64
+	deliveredTime time.Time
+	firstSendTime time.Time
+}
+
+const (
+	clumpGap      = 100 * time.Microsecond
+	maxSettledAge = time.Millisecond
+)
+
 // sendRec is what the connection knew when a packet left (§4.1.2.2).
 type sendRec struct {
-	at            time.Time
-	firstSendTime time.Time // send time of the packet most recently delivered before this one left
-	deliveredTime time.Time // when that delivery was acknowledged
-	delivered     int64     // packets delivered so far
-	lost          int64     // packets lost so far
-	txInFlight    int       // in flight, this packet included
-	appLimited    bool
-	done          bool // acknowledged or lost
+	at         time.Time     // when the sender says it left: what OnAck and OnLoss name it by
+	from       deliveryState // what the rate sample is measured from
+	delivered  int64         // packets delivered so far (for counting rounds)
+	lost       int64         // packets lost so far
+	txInFlight int           // in flight, this packet included
+	appLimited bool
+	done       bool // acknowledged or lost
 }
 
 // rateSample is the draft's RS: what one acknowledgement says.
@@ -143,7 +171,9 @@ type BBR struct {
 	lost          int64
 	deliveredTime time.Time
 	firstSendTime time.Time
-	appLimited    int64 // 0, or the delivered count that ends the app-limited phase
+	settled       deliveryState // the delivery record before the current clump of acks
+	settledAt     time.Time     // when the clump began
+	appLimited    int64         // 0, or the delivered count that ends the app-limited phase
 	cwndLimited   bool
 	srtt, latest  time.Duration
 	sends         []sendRec // every packet not yet acknowledged or lost, in send order
@@ -259,10 +289,17 @@ func (b *BBR) OnSend(now time.Time) {
 	b.lastNow = now
 	if b.inflight == 0 {
 		b.firstSendTime, b.deliveredTime = now, now
+		b.settled, b.settledAt = deliveryState{b.delivered, now, now}, now
 	}
 	b.inflight++
+	// What had been delivered, and as of when. If acks are still arriving in
+	// a clump, that is the state before the clump: see deliveryState.
+	from := b.settled
+	if now.Sub(b.deliveredTime) > clumpGap {
+		from = deliveryState{b.delivered, b.deliveredTime, b.firstSendTime}
+	}
 	b.sends = append(b.sends, sendRec{
-		at: now, firstSendTime: b.firstSendTime, deliveredTime: b.deliveredTime,
+		at: now, from: from,
 		delivered: b.delivered, lost: b.lost, txInFlight: b.inflight, appLimited: b.appLimited != 0,
 	})
 }
@@ -322,6 +359,11 @@ func (b *BBR) OnAck(now, sentAt time.Time, rtt time.Duration, _ float64, windowF
 	}
 
 	// UpdateRateSample and GenerateRateSample (§4.1.2.3).
+	if now.Sub(b.deliveredTime) > clumpGap || now.Sub(b.settledAt) > maxSettledAge {
+		// This ack does not continue a clump: what stood before it is settled.
+		b.settled = deliveryState{b.delivered, b.deliveredTime, b.firstSendTime}
+		b.settledAt = now
+	}
 	b.delivered++
 	b.deliveredTime = now
 	if b.appLimited != 0 && b.delivered > b.appLimited {
@@ -337,9 +379,9 @@ func (b *BBR) OnAck(now, sentAt time.Time, rtt time.Duration, _ float64, windowF
 	}
 	// The longer of how long it took to send that much and how long to have
 	// it acknowledged; anything shorter than min_rtt is not to be believed.
-	interval := max(rec.at.Sub(rec.firstSendTime), now.Sub(rec.deliveredTime))
+	interval := max(rec.at.Sub(rec.from.firstSendTime), now.Sub(rec.from.deliveredTime))
 	if interval > 0 && interval >= b.minRtt {
-		rs.deliveryRate = rs.delivered / interval.Seconds()
+		rs.deliveryRate = float64(b.delivered-rec.from.delivered) / interval.Seconds()
 	}
 
 	b.updateModelAndState(now, rs)
