@@ -15,6 +15,7 @@
     <label class="inline"><input id="mute" type="checkbox"> Mute</label>
     <details class="settings">
       <summary>Settings</summary>
+      <label>Video source <select id="source"><option value="">server default</option></select></label>
       <label>Bitrate (kbps, blank = server default) <input id="bitrate" type="number" min="100" step="100"></label>
       <label>Minimum playout delay (ms) <input id="minDelay" type="number" value="0" min="0" step="10"></label>
       <label>Give up on a late frame after (ms) <input id="maxWait" type="number" value="300" min="0" step="50"></label>

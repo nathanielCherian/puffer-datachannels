@@ -1,7 +1,7 @@
-// Command server streams a pre-recorded video to browsers over a WebRTC
-// DataChannel instead of an RTP media track: the server packetises, paces and
-// retransmits frames itself, and the page reassembles, buffers and decodes
-// them (WebCodecs). See README.md.
+// Command server streams a pre-recorded video, or the renditions of a
+// simulcast transcoder, to browsers over a WebRTC DataChannel instead of an
+// RTP media track: the server packetises, paces and retransmits frames itself,
+// and the page reassembles, buffers and decodes them (WebCodecs). See README.md.
 package main
 
 import (
@@ -28,6 +28,7 @@ import (
 	"puffer-datachannels/internal/media"
 	"puffer-datachannels/internal/ratecontrol"
 	"puffer-datachannels/internal/session"
+	"puffer-datachannels/internal/simulcast"
 	"puffer-datachannels/internal/x264"
 	"puffer-datachannels/web"
 )
@@ -67,7 +68,10 @@ func main() {
 		snapInt      = flag.Duration("snapshot-interval", 250*time.Millisecond, "server snapshot period (snapshots.jsonl and the page)")
 		logPackets   = flag.Bool("log-packets", true, "log every sent packet and every feedback to cc.jsonl")
 		logDir       = flag.String("log-dir", "logs", "root directory for per-session log directories")
-		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent sessions (a viewer is one ffmpeg decode and one x264 encode)")
+		maxSessions  = flag.Int("max-sessions", 8, "maximum concurrent sessions (a viewer of the file is one ffmpeg decode and one x264 encode; a simulcast viewer encodes nothing)")
+		simSpec      = flag.String("simulcast", "", "shared pre-encoded renditions to offer as the \"simulcast\" source: name=host:port@bitrate,... "+
+			"(MPEG-TS over UDP, e.g. high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k)")
+		simAudio = flag.String("simulcast-audio", "", "rendition whose AAC audio is transcoded (once) to Opus for simulcast sessions; default the highest, \"none\" for no audio")
 
 		ccAlgorithm  = flag.String("cc-algorithm", "copa", "cc page: congestion controller when the page does not choose: "+strings.Join(session.Algorithms(), ", "))
 		ccMaxRate    = flag.Int("cc-max-rate", 20_000_000, "cc page: the most a session may send (bps); the page can ask for less")
@@ -98,11 +102,51 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Optional shared simulcast source: pre-encoded renditions arriving as
+	// MPEG-TS over UDP, demuxed once and forwarded by every simulcast session.
+	var hub *simulcast.Hub
+	if *simSpec != "" {
+		layers, err := simulcast.ParseLayers(*simSpec)
+		if err != nil {
+			log.Fatalf("--simulcast: %v", err)
+		}
+		audioLayer := 0
+		switch {
+		case !*audio || *simAudio == "none":
+			audioLayer = -1
+		case *simAudio != "":
+			audioLayer = -1
+			for i, l := range layers {
+				if l.Name == *simAudio {
+					audioLayer = i
+				}
+			}
+			if audioLayer < 0 {
+				log.Fatalf("--simulcast-audio: no layer named %q", *simAudio)
+			}
+		}
+		hub = simulcast.NewHub(layers, simulcast.Options{AudioLayer: audioLayer, AudioBitrate: *audioBitrate})
+		conns, err := hub.Listen()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go hub.Run(ctx, conns)
+		for _, l := range layers {
+			log.Printf("simulcast layer %s: %d kbps from udp %s", l.Name, l.BitrateBps/1000, l.Addr)
+		}
+	}
+
+	// With a simulcast source the video file is optional.
 	info, err := media.Probe(ctx, *videoPath)
-	if err != nil {
+	switch {
+	case err == nil:
+		log.Printf("source %s: %dx%d @ %.3f fps, %.1fs, audio: %v", info.Path, info.Width, info.Height, info.FPS, info.DurationSec, info.HasAudio)
+	case hub != nil:
+		info = nil
+		log.Printf("no video file (%v): serving the simulcast source only", err)
+	default:
 		log.Fatalf("probe video: %v (generate a stand-in with `make standin`)", err)
 	}
-	log.Printf("source %s: %dx%d @ %.3f fps, %.1fs, audio: %v", info.Path, info.Width, info.Height, info.FPS, info.DurationSec, info.HasAudio)
 
 	se := webrtc.SettingEngine{}
 	session.Settings(&se, uint32(*sctpMinCwnd))
@@ -158,12 +202,18 @@ func main() {
 		"sctpMinCwnd": *sctpMinCwnd, "emulateLoss": *emulateLoss, "emulateDelayMs": emulateDelay.Milliseconds(),
 		"emulateRate": *emulateRate, "emulateQueueMs": emulateQueue.Milliseconds(),
 	})
+	var simStatus func() any = func() any { return nil }
+	if hub != nil {
+		mgr.SetSimulcast(hub)
+		simStatus = func() any { return hub.Snapshot() }
+	}
 
 	mux := http.NewServeMux()
 	static, _ := fs.Sub(web.FS, ".")
 	mux.Handle("GET /", http.FileServerFS(static))
 	mux.HandleFunc("GET /info", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"media": info, "config": cfg, "sessions": mgr.ActiveSessions()})
+		writeJSON(w, http.StatusOK, map[string]any{"media": info, "config": cfg, "sessions": mgr.ActiveSessions(),
+			"sources": mgr.Sources(), "simulcast": simStatus()})
 	})
 	mux.HandleFunc("POST /offer", func(w http.ResponseWriter, r *http.Request) {
 		var req session.OfferRequest
@@ -208,7 +258,7 @@ func main() {
 
 func writeOfferResponse(w http.ResponseWriter, r *http.Request, resp *session.OfferResponse, err error) {
 	switch {
-	case errors.Is(err, session.ErrTooManySessions):
+	case errors.Is(err, session.ErrTooManySessions), errors.Is(err, session.ErrNoSource):
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 	case errors.Is(err, session.ErrBadOffer):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

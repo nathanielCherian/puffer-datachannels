@@ -18,6 +18,11 @@ mp4 ─ffmpeg (decode, real time, loop)─┬► raw I420 ─► x264 ─► fra
 Derived from `puffer-webrtc-v2` (same ffmpeg source, x264 wrapper and log
 layout).
 
+The source can also be the renditions of a simulcast transcoder (the `sfu`
+project's, or any that sends the same thing): nothing is then encoded per
+viewer, and the rate controller's target chooses which rendition a viewer is
+forwarded. See [Simulcast source](#simulcast-source).
+
 ## Running
 
 Needs Go 1.24+, a C toolchain, `libx264` with `pkg-config`, and `ffmpeg`.
@@ -36,7 +41,9 @@ also be set as `PUFFER_<FLAG>`.
 |---|---|---|
 | `--bitrate` | 1500000 | what the fixed controller sends at, audio included (the page can override it per session) |
 | `--audio`, `--audio-bitrate` | true, 64000 | send the source's audio as Opus; its bitrate comes out of `--bitrate` |
-| `--cc` | `fixed` | rate controller |
+| `--cc` | `fixed` | rate controller: `fixed`, or `sweep` (testing: the target goes from `--min-bitrate` to `--max-bitrate` and back every 60 s) |
+| `--simulcast` | | renditions for the [simulcast source](#simulcast-source): `name=host:port@bitrate,...` (MPEG-TS over UDP; this server binds the ports) |
+| `--simulcast-audio` | highest rendition | rendition whose AAC is transcoded, once, to Opus; `none` for no audio |
 | `--pacing-factor` | 2.0 | pacer drain rate ÷ bitrate |
 | `--headroom` | 0.9 | (video encoder + audio) bitrate ÷ controller target |
 | `--keyint` | 0 | seconds between keyframes (0 = only when the browser asks) |
@@ -107,8 +114,10 @@ type Controller interface {
 ```
 
 Implement it, `Register("name", factory)` in an `init`, run with `--cc name`.
-`Fixed` in the same file is the template. The encoder follows `TargetBitrate`
-within 100 ms. Each sent packet appears in exactly one `Feedback`, either
+`Fixed` in the same file is the template; `Sweep` beside it is a moving target
+with no network behind it, for watching what follows the target. The encoder
+follows `TargetBitrate` within 100 ms; a simulcast session re-chooses its
+rendition from it every 100 ms. Each sent packet appears in exactly one `Feedback`, either
 received or lost (unacknowledged and 16 packets behind the newest ack, or 2 s
 old). Arrival times are on the browser's clock: use differences. Audio packets
 (`SentPacket.Audio`) share the sequence numbers and the pacer, and leave ahead
@@ -330,6 +339,126 @@ block scheduled sample-exact on the Web Audio clock).
 - **Autoplay:** the audio context is created in the Start click. If the
   browser still keeps it suspended, the page says so in Events.
 
+## Simulcast source
+
+The file source encodes the video once per viewer. The simulcast source
+encodes nothing: an SFU-side transcoder produces a few renditions of one live
+feed, the server ingests them once, and every viewer is forwarded one of them
+over the same DataChannel path as before (fragmenting, pacing, NACK, the
+jitter buffers and decoders are unchanged).
+
+```
+                    MPEG-TS/UDP                   ┌─ viewer A: controller target ─► forwards high ─► sender ─► browser
+transcoder ─┬─ high 2500k :5001 ─┐                │
+(sfu, or    ├─ mid   800k :5002 ─┼─► hub ─────────┼─ viewer B: controller target ─► forwards mid ──► sender ─► browser
+ ffmpeg)    └─ low   250k :5003 ─┘ (demux once,   │
+                                   one timeline,  └─ viewer C: controller target ─► forwards low ──► sender ─► browser
+                                   AAC→Opus once)
+```
+
+```sh
+# 1. a transcoder: the sfu project's (`python -m transcoder`, UDP outputs), or
+#    the stand-in here: one ffmpeg, three renditions of media/standin.mp4
+#    (2 s between keyframes) to UDP 5001-5003. LAYERS/GOP/FPS/HOST are env knobs.
+make renditions
+
+# 2. this server; it binds those ports
+./bin/server --simulcast high=127.0.0.1:5001@2500k,mid=127.0.0.1:5002@800k,low=127.0.0.1:5003@250k
+
+# to watch it change rendition without a network that makes a controller move:
+./bin/server --simulcast ... --cc sweep --min-bitrate 450000 --max-bitrate 5000000
+```
+
+On the page, **Settings → Video source** offers "Live simulcast" and selects it
+when the server has it. With `--simulcast`, `--video` is optional: without a
+file the server serves the renditions only. The offer field is
+`"source": "simulcast"` (or `"file"`); `GET /info` lists `sources` and the
+hub's per-rendition status under `simulcast`.
+
+**What the renditions must be.** H.264 in MPEG-TS, one UDP port each, with:
+keyframes (IDR) at the same timestamps in every rendition, SPS/PPS repeated
+with each one, no B-frames, and one 90 kHz clock shared by all renditions (and
+by the AAC, if there is audio). This is what the `sfu` transcoder and
+`scripts/simulcast-renditions.sh` produce. Access unit delimiters and filler
+(the padding of a strict-CBR encoder) are dropped on the way in.
+
+**The hub (`internal/simulcast`).** One per server. It demultiplexes each
+port, reads each rendition's size from its SPS, and hands every access unit to
+all simulcast sessions without copying it. Two things here exist because the
+transport is a DataChannel and not RTP:
+
+- *Capture times.* The page schedules by each packet's capture time, so the
+  hub gives every frame one: its PTS mapped onto the server's clock
+  (`timeline.go`). The first frame anchors the mapping; after that a capture
+  time is the anchor plus the PTS difference, so frames keep the source's
+  spacing however unevenly the transcoder delivered them, and the same instant
+  has the same capture time in every rendition. A source that restarts on a new
+  timeline is anchored again after a second (`timelineReanchors`); a clock
+  that runs a little fast or slow is followed 5 ms per 10 s
+  (`timelineSlewMs`).
+- *Nothing early.* A frame or audio packet that arrives ahead of its own
+  capture time is held in the hub until then (`held` per rendition,
+  `audioHeld`). A transcoder reading a looped file sends a run of them where
+  the file wraps: with the stand-in, 15 frames up to 0.4 s early, once a
+  minute. Passed straight on, the jitter buffers took "early" for the new
+  normal and the picture froze for 0.2 s half a minute later, when they let go
+  of it.
+
+**Per viewer (`internal/session/simulcast.go`).** The viewer's controller
+gives a video budget exactly as for the file source (`--headroom` × target,
+less audio). The rendition forwarded is the highest whose nominal bitrate
+fits:
+
+- **Down** as soon as the current rendition no longer fits; **up** once the
+  budget has covered 1.1× the higher one for 1 s.
+- **When:** on the next keyframe of the rendition being switched to. The
+  browser sees consecutive frame ids and continuous capture times; the
+  keyframe's SPS is different, and the page configures its decoder again
+  (Events: `decoder … (new parameters at frame N)`). The canvas keeps the size
+  the session started with and a smaller picture is scaled up.
+- **One keyframe per instant.** The renditions' copies of the keyframe instant
+  arrive a few ms apart, in either order. Once a switch is decided the current
+  rendition's keyframe is held for up to 100 ms and replaced by the new
+  rendition's when that arrives (`framesReplacedAtSwitch`), rather than sent
+  ahead of it for nothing.
+- **Keyframes cannot be forced.** Where the file source makes an IDR (the
+  browser asked for one, or the pacer refused a frame), a simulcast session
+  stops forwarding until the rendition's next periodic keyframe
+  (`keyframeWaits`, `framesSkippedWaitingForKey`): nothing in between would
+  decode. The keyframe interval therefore bounds startup (1 s on average with
+  2 s between keyframes), how soon a switch takes effect, and recovery from a
+  loss that retransmission did not repair. A KEYREQ names the newest frame the
+  browser had seen; one from before the newest keyframe was sent is ignored,
+  so the browser repeating itself does not cost a second interval.
+
+**Audio.** The AAC of one rendition goes through one ffmpeg for the whole
+server and comes out as the same 20 ms Opus packets the file source sends. Its
+timestamps do not travel through that pipe, so a packet's capture time is the
+PTS of the first AAC frame given to this ffmpeg plus the packet's position in
+its output; the hub checks every AAC packet against what it has fed, and a gap
+(lost datagrams, a restarted source) starts a fresh ffmpeg and a fresh count
+(`audioRestarts`). Packet ids follow capture time, so a gap in the audio is a
+gap in the ids. MPEG-TS carries several AAC frames per packet, so audio
+reaches the hub in steps of about 150 ms; the audio buffer absorbs that and
+video waits for it (lip sync), which puts a simulcast viewer some 300 ms
+behind the source where a file viewer is tens of ms behind its encoder.
+
+Measured on loopback with the stand-in renditions and `--cc sweep` between
+0.45 and 5 Mbps, 112 s in Chrome, across two wraps of the looped clip: 8
+switches (both directions between each pair of neighbouring renditions), no
+freeze, no decoder error, no keyframe wait, no frame dropped, video within
+35 ms of audio. One audio packet (20 ms) came too late to be played, where
+ffmpeg stalled for 150 ms at a wrap.
+
+What is not here: padding. A controller that only raises its estimate as far
+as it has seen delivered (GCC) would, forwarding a 250 kbps rendition, never
+find out that 2.5 Mbps fits; `puffer-webrtc-v2` pads for that reason. The
+controllers of the congestion-control page are window-based and would need
+the same when they drive media. With `fixed` the rendition is simply the one
+that fits `--bitrate` (or the page's bitrate): 1.5 Mbps gives `mid` above,
+3 Mbps gives `high`. Selection also goes by the nominal bitrates in
+`--simulcast`, not by what a rendition measures (`measuredBps` in `/info`).
+
 ## Wire format
 
 `internal/wire/wire.go` (Go) and `web/wire.js` (browser). DATA has a 30-byte
@@ -342,11 +471,11 @@ One directory per session; every line is `{"t": <server unix ms>, "kind", "data"
 
 | file | |
 |---|---|
-| `meta.json` | config, media, client info, SDP |
-| `events.jsonl` | state changes, keyframe requests, dropped frames |
+| `meta.json` | config, media, client info, SDP, `source`, and for simulcast the renditions |
+| `events.jsonl` | state changes, keyframe requests, dropped frames; simulcast: `layerPending` (a switch was decided) and `layer` (it happened) |
 | `cc.jsonl` | `sent` (every packet) and `feedback` (per-packet results, RTT, rates afterwards); `--log-packets=false` turns it off. A congestion-control session has `sent`, `ack` and `lost` instead |
-| `encoder.jsonl` | every frame (size, keyframe, encode time, whether it was queued), reconfigurations |
-| `snapshots.jsonl` | every 250 ms: counters, pacer queue, rates, encoder, audio, SCTP backlog |
+| `encoder.jsonl` | every frame (size, keyframe, encode time, whether it was queued), reconfigurations. Simulcast: every forwarded frame (`layer`, `pts`, `lateMs` = how far behind its capture time it reached the hub, `hubMs` = how long it then waited there, `encMs` 0) and a `reconfig` per switch |
+| `snapshots.jsonl` | every 250 ms: counters, pacer queue, rates, encoder, audio, SCTP backlog; simulcast: `simulcast` (rendition, pending switch, budget, switches, keyframe waits) and `hub` (per-rendition status, timeline, audio transcoder) |
 | `client.jsonl` | the page's stats (every 500 ms) and events |
 
 ## Limits
@@ -356,7 +485,10 @@ One directory per session; every line is `{"t": <server unix ms>, "kind", "data"
   ms, and a background tab stalls.
 - "Network delay" and "capture → render" on the page assume a symmetric path
   (clock offset from the lowest-RTT ping).
-- Each viewer costs one ffmpeg decode, one Opus encode and one x264 encode.
+- Each viewer of the file costs one ffmpeg decode, one Opus encode and one
+  x264 encode. A simulcast viewer costs none of them.
+- A simulcast viewer cannot be sent a keyframe on request and is not padded up
+  to its controller's target (see [Simulcast source](#simulcast-source)).
 - A source without an audio stream plays video only.
 - `--emulate-rate` shapes only what the server sends, and all of it: data,
   SACKs for the page's acks, pongs and the stats channel share the link.

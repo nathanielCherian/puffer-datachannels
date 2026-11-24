@@ -1,11 +1,14 @@
 // Package session owns one viewer: its PeerConnection (DataChannels only),
-// the ffmpeg pipeline (decoded video, Opus audio), the x264 encoder, and the
-// sender that paces both onto the "media" DataChannel.
+// its source, and the sender that paces video and audio onto the "media"
+// DataChannel. The source is either the viewer's own ffmpeg pipeline (decoded
+// video, Opus audio) and x264 encoder, or the shared pre-encoded renditions of
+// a simulcast hub (simulcast.go).
 package session
 
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +24,7 @@ import (
 	"puffer-datachannels/internal/logs"
 	mediasrc "puffer-datachannels/internal/media"
 	"puffer-datachannels/internal/ratecontrol"
+	"puffer-datachannels/internal/simulcast"
 	"puffer-datachannels/internal/wire"
 	"puffer-datachannels/internal/x264"
 )
@@ -87,7 +91,8 @@ func Settings(se *webrtc.SettingEngine, minCwnd uint32) {
 // Manager creates and tracks sessions.
 type Manager struct {
 	cfg      Config
-	info     *mediasrc.Info
+	info     *mediasrc.Info // the video file; nil when the server has none (simulcast only)
+	hub      *simulcast.Hub // the simulcast source; nil without --simulcast
 	settings webrtc.SettingEngine
 	host     map[string]any
 
@@ -130,6 +135,7 @@ type OfferRequest struct {
 	SDP     string          `json:"sdp"`
 	Type    string          `json:"type"`
 	Bitrate int             `json:"bitrate,omitempty"` // bps; overrides --bitrate for this session
+	Source  string          `json:"source,omitempty"`  // "file" or "simulcast"; default: file if the server has one
 	Client  json.RawMessage `json:"client,omitempty"`  // arbitrary client metadata, logged
 }
 
@@ -158,7 +164,8 @@ type Session struct {
 	mediaDC atomic.Pointer[webrtc.DataChannel]
 	ctrlDC  atomic.Pointer[webrtc.DataChannel] // reliable: hello, snapshots, the page's stats
 
-	enc         *x264.Encoder
+	sim         *simState     // nil unless the source is simulcast
+	enc         *x264.Encoder // nil for simulcast
 	audioOn     bool          // audio is enabled and the source has some
 	mediaStart  time.Time     // wall time of media time zero; valid once mediaReady is closed
 	mediaReady  chan struct{} // closed when the first video frame has been read
@@ -210,6 +217,25 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		}
 		cfg.StartBitrate = req.Bitrate
 	}
+	source, info := req.Source, m.info
+	if source == "" {
+		source = m.Sources()[0]
+	}
+	var sim *simState
+	switch source {
+	case SourceFile:
+		if info == nil {
+			return nil, fmt.Errorf("%w: this server has no video file", ErrNoSource)
+		}
+	case SourceSimulcast:
+		var err error
+		if info, err = m.simulcastInfo(); err != nil {
+			return nil, err
+		}
+		sim = m.newSimState()
+	default:
+		return nil, fmt.Errorf("%w: unknown source %q", ErrBadOffer, source)
+	}
 	ctrl, err := ratecontrol.New(cfg.Controller, ratecontrol.Config{
 		StartBitrate: cfg.StartBitrate, MinBitrate: cfg.MinBitrate, MaxBitrate: cfg.MaxBitrate, PacingFactor: cfg.PacingFactor,
 	})
@@ -217,8 +243,8 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 		return nil, err
 	}
 
-	s := &Session{id: newID(), mgr: m, cfg: cfg, info: m.info, created: time.Now(), ctrl: ctrl,
-		audioOn: cfg.Audio && m.info.HasAudio && cfg.AudioBitrate > 0, mediaReady: make(chan struct{})}
+	s := &Session{id: newID(), mgr: m, cfg: cfg, info: info, sim: sim, created: time.Now(), ctrl: ctrl,
+		audioOn: cfg.Audio && info.HasAudio && cfg.AudioBitrate > 0, mediaReady: make(chan struct{})}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	if s.log, err = logs.NewSession(cfg.LogDir, s.id); err != nil {
 		return nil, fmt.Errorf("create log: %w", err)
@@ -247,16 +273,16 @@ func (m *Manager) HandleOffer(ctx context.Context, req OfferRequest, remoteAddr 
 	_ = s.log.WriteMeta(map[string]any{
 		"sessionId": s.id, "createdAt": s.created.UTC().Format(time.RFC3339Nano), "createdMs": logs.Ms(s.created),
 		"remoteAddr": remoteAddr, "client": req.Client, "media": s.info, "config": cfg, "host": m.host,
-		"offer": req.SDP, "answer": ld.SDP,
+		"source": source, "simulcast": s.simDescribe(), "offer": req.SDP, "answer": ld.SDP,
 		"files": map[string]string{
-			"events.jsonl":    "server state changes (pc/ice states, channels, media start, keyframe requests, dropped frames, close)",
+			"events.jsonl":    "server state changes (pc/ice states, channels, media start, keyframe requests, dropped frames, close; simulcast: layer = a switch happened, layerPending = decided, waiting for a keyframe)",
 			"cc.jsonl":        "the rate controller's inputs: sent (every DATA packet: seq, len, frame, rtx, audio) and feedback (per-packet results with browser receive times, RTT, target and pacing rate afterwards)",
-			"encoder.jsonl":   "every encoded video frame (id, bytes, keyframe, encode time, configured bitrate, whether it was sent) and every encoder reconfiguration",
-			"snapshots.jsonl": "periodic server snapshot (sender counters, pacer queue, rates, encoder window, audio, SCTP buffered amount)",
+			"encoder.jsonl":   "every encoded video frame (id, bytes, keyframe, encode time, configured bitrate, whether it was sent) and every encoder reconfiguration. Simulcast: every forwarded frame (encMs 0, plus layer, pts, hubMs = time in the hub, lateMs = arrival behind the source timeline, cfgBps = the layer's nominal bitrate) and a reconfig with the layer at every switch",
+			"snapshots.jsonl": "periodic server snapshot (sender counters, pacer queue, rates, encoder window, audio, SCTP buffered amount; simulcast: the session's layer state and the hub's per-layer status)",
 			"client.jsonl":    "what the page reported over the ctrl channel (t = server receive time)",
 		},
 	})
-	log.Printf("[%s] new session from %s (log: %s)", s.id, remoteAddr, s.log.Dir)
+	log.Printf("[%s] new %s session from %s (log: %s)", s.id, source, remoteAddr, s.log.Dir)
 	return &OfferResponse{SDP: ld.SDP, Type: ld.Type.String(), SessionID: s.id, LogDir: s.log.Dir}, nil
 }
 
@@ -298,6 +324,7 @@ func (s *Session) setup(ctx context.Context, req OfferRequest) error {
 				s.sendCtrl(map[string]any{
 					"type": "hello", "sessionId": s.id, "serverTimeMs": logs.NowMs(), "logDir": s.log.Dir,
 					"media": s.info, "config": s.cfg, "feedbackIntervalMs": ms(s.cfg.FeedbackInterval),
+					"source": s.source(), "simulcast": s.simDescribe(),
 					"audio": map[string]any{"enabled": s.audioOn, "bitrate": s.cfg.AudioBitrate, "sampleRate": mediasrc.AudioRate,
 						"channels": 2, "frameMs": ms(mediasrc.AudioFrame)},
 				})
@@ -357,7 +384,12 @@ func (s *Session) onMediaMessage(dc *webrtc.DataChannel, b []byte) {
 		}
 	case wire.TypeKeyReq:
 		s.keyRequests.Add(1)
-		if s.forceIDR.CompareAndSwap(false, true) {
+		if s.sim != nil {
+			// The encoder is shared: there is no keyframe to force, only one to wait for.
+			if len(b) >= 5 {
+				s.simKeyRequest(binary.BigEndian.Uint32(b[1:]))
+			}
+		} else if s.forceIDR.CompareAndSwap(false, true) {
 			s.event("keyframeRequest", "browser asked for a keyframe")
 		}
 	}
@@ -377,6 +409,21 @@ func (s *Session) onCtrlMessage(b []byte) {
 
 // run starts media once the media channel is open.
 func (s *Session) run(dc *webrtc.DataChannel) {
+	// Once the sender is stored the browser's feedback reaches the controller,
+	// which from then on is only touched with the sender's lock held.
+	startSender := func() *sender {
+		snd := newSender(dc.Send, s.ctrl, senderConfig{
+			MaxQueue: s.cfg.MaxQueue, History: s.cfg.History, ReorderGap: 16, LossTimeout: 2 * time.Second,
+		}, s.cfg.LogPackets, func(kind string, t time.Time, data any) { s.log.LogAt("cc", t, kind, data) })
+		s.snd.Store(snd)
+		return snd
+	}
+	if s.sim != nil {
+		target := s.ctrl.TargetBitrate()
+		s.runSimulcast(dc, startSender(), target)
+		return
+	}
+
 	keyint := 0
 	if s.cfg.KeyIntSec > 0 {
 		keyint = int(math.Round(s.cfg.KeyIntSec * s.info.FPS))
@@ -397,11 +444,7 @@ func (s *Session) run(dc *webrtc.DataChannel) {
 	}()
 	s.log.Log("encoder", "reconfig", map[string]any{"target": s.ctrl.TargetBitrate(), "applied": s.enc.Bitrate(), "initial": true,
 		"preset": s.cfg.X264Preset, "keyint": keyint, "headroom": s.cfg.Headroom})
-
-	snd := newSender(dc.Send, s.ctrl, senderConfig{
-		MaxQueue: s.cfg.MaxQueue, History: s.cfg.History, ReorderGap: 16, LossTimeout: 2 * time.Second,
-	}, s.cfg.LogPackets, func(kind string, t time.Time, data any) { s.log.LogAt("cc", t, kind, data) })
-	s.snd.Store(snd)
+	snd := startSender()
 
 	audioBitrate := 0
 	if s.audioOn {
@@ -425,6 +468,27 @@ func (s *Session) run(dc *webrtc.DataChannel) {
 	}
 	go s.bitrateLoop()
 	go s.snapshotLoop(dc, snd)
+}
+
+func (s *Session) source() string {
+	if s.sim != nil {
+		return SourceSimulcast
+	}
+	return SourceFile
+}
+
+// countFrame adds one video frame handed to the sender to the encoder stats.
+func (s *Session) countFrame(bytes int, key bool, encDur time.Duration) {
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
+	for _, w := range []*encWindow{&s.encWin, &s.encTotal} {
+		w.Frames++
+		w.Bytes += int64(bytes)
+		w.EncodeMs += ms(encDur)
+		if key {
+			w.Keyframes++
+		}
+	}
 }
 
 // videoBitrateFor converts the controller's target, which is for everything
@@ -501,16 +565,7 @@ func (s *Session) videoLoop(pipe *mediasrc.Pipeline, snd *sender) {
 			s.forceIDR.Store(true)
 			s.event("frameDropped", fmt.Sprintf("frame %d: pacer queue over %v", frameID, s.cfg.MaxQueue))
 		}
-		s.encMu.Lock()
-		for _, w := range []*encWindow{&s.encWin, &s.encTotal} {
-			w.Frames++
-			w.Bytes += int64(len(f.Data))
-			w.EncodeMs += ms(encDur)
-			if f.Keyframe {
-				w.Keyframes++
-			}
-		}
-		s.encMu.Unlock()
+		s.countFrame(len(f.Data), f.Keyframe, encDur)
 		s.log.LogAt("encoder", capture, "frame", map[string]any{
 			"id": frameID, "n": n, "bytes": len(f.Data), "key": f.Keyframe, "forced": forced && f.Keyframe,
 			"encMs": ms(encDur), "cfgBps": s.enc.Bitrate(), "queued": queued,
@@ -619,7 +674,18 @@ func (s *Session) snapshotLoop(dc *webrtc.DataChannel, snd *sender) {
 			}
 			snap["audio"] = audio
 		}
-		enc := map[string]any{"configuredBitrate": s.enc.Bitrate(), "frames": total.Frames, "keyframes": total.Keyframes, "bytes": total.Bytes}
+		// For simulcast "encoder" is what was forwarded: the layer's nominal
+		// bitrate, and the frames and bytes handed to the sender.
+		configured := 0
+		if s.sim != nil {
+			configured = s.simLayerBitrate()
+			snap["simulcast"] = s.simSnapshot()
+			snap["hub"] = s.mgr.hub.Snapshot()
+		} else {
+			configured = s.enc.Bitrate()
+		}
+		snap["source"] = s.source()
+		enc := map[string]any{"configuredBitrate": configured, "frames": total.Frames, "keyframes": total.Keyframes, "bytes": total.Bytes}
 		if wdt := now.Sub(w.since).Seconds(); wdt > 0 && w.Frames > 0 {
 			enc["bitrate"] = float64(w.Bytes) * 8 / wdt
 			enc["fps"] = float64(w.Frames) / wdt

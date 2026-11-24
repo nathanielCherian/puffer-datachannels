@@ -202,6 +202,19 @@ func (s *sender) run(ctx context.Context) {
 	}
 }
 
+// videoQueued reports whether any part of a video frame is still waiting for
+// its first transmission.
+func (s *sender) videoQueued(frameID uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.queue {
+		if p.frameID == frameID {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *sender) popLocked() *packet {
 	q := &s.queue
 	if len(s.audioQueue) > 0 {

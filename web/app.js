@@ -21,6 +21,7 @@ const charts = {
     { key: 'recv', name: 'client received' },
     { key: 'rtx', name: 'retransmissions' },
     { key: 'audio', name: 'audio' },
+    { key: 'layer', name: 'simulcast layer (nominal)' },
   ]),
   delay: new Chart($('c-delay'), [
     { key: 'e2e', name: 'capture → render' },
@@ -63,7 +64,19 @@ function sendMedia(buf) {
 $('start').onclick = start;
 $('stop').onclick = () => stop('stopped');
 $('mute').onchange = () => { if (S.player) S.player.setMuted($('mute').checked); };
-const inputs = ['bitrate', 'minDelay', 'maxWait', 'nack', 'avsync', 'stun'];
+const inputs = ['source', 'bitrate', 'minDelay', 'maxWait', 'nack', 'avsync', 'stun'];
+
+// The sources this server offers. A simulcast source, when there is one, is
+// the default: it is what the server was started for.
+const SOURCE_NAMES = { file: 'Video file (encoded per viewer)', simulcast: 'Live simulcast (shared renditions)' };
+fetch('info').then((r) => r.json()).then((info) => {
+  const sources = info.sources || [];
+  if (!sources.length) return;
+  const sel = $('source');
+  sel.innerHTML = '';
+  for (const s of sources) sel.add(new Option(SOURCE_NAMES[s] || s, s));
+  if (sources.includes('simulcast')) sel.value = 'simulcast';
+}).catch(() => { /* the server's default source is used */ });
 
 async function start() {
   if (!('VideoDecoder' in window)) {
@@ -75,7 +88,8 @@ async function start() {
   $('events').innerHTML = '';
   for (const c of Object.values(charts)) c.reset();
   Object.assign(S, {
-    t0: now(), hello: null, server: null, decoder: null, configured: false, decodeMeta: new Map(), firstCaptureMs: null,
+    t0: now(), hello: null, server: null, decoder: null, configured: false, sps: null, decodeMeta: new Map(), firstCaptureMs: null,
+    layer: null, picture: null,
     arrivals: [], prevArrivals: [], fbSeq: 0, fbIntervalMs: 50,
     pings: [], clock: null, pingId: 1,
     firstSeq: null, maxSeq: -1,
@@ -148,6 +162,7 @@ async function start() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sdp: pc.localDescription.sdp, type: pc.localDescription.type, bitrate: kbps > 0 ? Math.round(kbps * 1000) : undefined,
+        source: $('source').value || undefined,
         client: { userAgent: navigator.userAgent, timeOrigin: performance.timeOrigin, jitterBuffer: { ...S.jb.o, sendNack: undefined, sendKeyRequest: undefined, rttMs: undefined } },
       }),
     });
@@ -208,8 +223,19 @@ function onCtrl(msg) {
     if (S.ajb) S.ajb.o.frameMs = S.player.o.frameMs = a.frameMs;
     logEvent('hello', `${msg.media.width}x${msg.media.height} @ ${msg.media.fps.toFixed(2)} fps, controller ${msg.config.Controller}, ${msg.config.StartBitrate / 1000} kbps, ` +
       (a.enabled ? `audio Opus ${a.bitrate / 1000} kbps` : 'no audio'));
+    if (msg.simulcast) {
+      logEvent('simulcast', msg.simulcast.layers.map((l) =>
+        `${l.name} ${l.width}x${l.height} ${l.nominalBps / 1000} kbps${l.live ? '' : ' (not live)'}`).join(', '));
+    }
   } else if (msg.type === 'server-stats') {
     S.server = msg.data;
+    // Which rendition the server is forwarding. The switch itself needs nothing
+    // from the page: it arrives as the next keyframe.
+    const sim = msg.data.simulcast;
+    if (sim && sim.layerIndex >= 0 && sim.layer !== S.layer) {
+      logEvent('layer', S.layer ? `${S.layer} → ${sim.layer} (${sim.layerBps / 1000} kbps)` : `${sim.layer} (${sim.layerBps / 1000} kbps)`);
+      S.layer = sim.layer;
+    }
   }
 }
 
@@ -286,16 +312,22 @@ function onPong(p, t4) {
 // ---------------------------------------------------------------------------
 // Decoding and rendering
 // ---------------------------------------------------------------------------
-// The codec string comes from the SPS (NAL type 7) of the first keyframe:
-// avc1.PPCCLL = profile_idc, constraint flags, level_idc.
-function codecFromSPS(data) {
+// The decoder is configured from the SPS (NAL type 7) of a keyframe. The codec
+// string is avc1.PPCCLL = profile_idc, constraint flags, level_idc, the three
+// bytes after the NAL header.
+function spsOf(data) {
   for (let i = 0; i + 7 < data.length; i++) {
     if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1 && (data[i + 3] & 0x1f) === 7) {
-      return 'avc1.' + [data[i + 4], data[i + 5], data[i + 6]].map((b) => b.toString(16).padStart(2, '0')).join('');
+      let end = i + 4;
+      while (end + 2 < data.length && !(data[end] === 0 && data[end + 1] === 0 && data[end + 2] <= 1)) end++;
+      if (end + 2 >= data.length) end = data.length;
+      return data.subarray(i + 3, end);
     }
   }
   return null;
 }
+const codecFromSPS = (sps) => 'avc1.' + [sps[1], sps[2], sps[3]].map((b) => b.toString(16).padStart(2, '0')).join('');
+const sameBytes = (a, b) => a && b && a.length === b.length && a.every((v, i) => v === b[i]);
 
 function decoderFailed(why) {
   S.n.decodeErrors++;
@@ -315,13 +347,19 @@ function decode(f) {
     });
     S.decoder = decoder;
   }
-  if (!S.configured) {
-    const codec = f.key && codecFromSPS(f.data);
-    if (!codec) return decoderFailed('first frame is not a keyframe with an SPS');
+  // A keyframe whose SPS differs from the one in use starts a different stream:
+  // a simulcast session switched rendition, so the picture size (and perhaps
+  // the level) changed. The decoder is configured again for it; frames it
+  // still holds from before come out first.
+  const sps = f.key ? spsOf(f.data) : null;
+  if (!S.configured || (sps && !sameBytes(sps, S.sps))) {
+    if (!sps) return decoderFailed('first frame is not a keyframe with an SPS');
+    const codec = codecFromSPS(sps);
     // No `description`: the stream is Annex B and carries SPS/PPS in every keyframe.
     S.decoder.configure({ codec, optimizeForLatency: true });
+    logEvent('decoder', S.configured ? `${codec} (new parameters at frame ${f.frameId})` : codec);
     S.configured = true;
-    logEvent('decoder', codec);
+    S.sps = sps;
   }
   if (S.firstCaptureMs === null) S.firstCaptureMs = f.captureMs;
   const timestamp = Math.round((f.captureMs - S.firstCaptureMs) * 1000);
@@ -337,7 +375,9 @@ function onDecoded(vf) {
   const t = now();
   const f = S.decodeMeta.get(vf.timestamp);
   S.decodeMeta.delete(vf.timestamp);
+  // The canvas keeps the size the server announced; a smaller rendition is scaled up to it.
   ctx2d.drawImage(vf, 0, 0, canvas.width, canvas.height);
+  S.picture = `${vf.displayWidth}×${vf.displayHeight}`;
   vf.close();
   if (!S.pc || !f) return;
   S.n.rendered++;
@@ -400,14 +440,15 @@ function report() {
     e2eMs: avg(w.e2e), e2eMaxMs: maxOf(w.e2e), owdMs: avg(w.owd), owdMaxMs: maxOf(w.owd), decodeMs: avg(w.decodeMs),
     rttMs: S.lastRttMs, clockOffsetMs: S.clock && S.clock.offsetMs, clockRttMs: S.clock && S.clock.rttMs,
     packetsExpected: expected, lossPct: expected ? 100 * (1 - S.n.packets / expected) : 0,
-    firstRenderMs: S.firstRenderMs, ...S.n, jitterBuffer: jb, audio,
+    firstRenderMs: S.firstRenderMs, picture: S.picture, ...S.n, jitterBuffer: jb, audio,
   };
   sendCtrl('stats', stats);
 
   const sv = S.server || {};
   const enc = sv.encoder || {};
+  const sim = sv.simulcast;
   const k = (bps) => (bps === undefined || bps === null ? null : bps / 1000);
-  charts.bitrate.push(t, { target: k(sv.targetBitrate), sent: k(sv.sendBitrate), encoded: k(enc.bitrate), recv: k(stats.recvBitrate), rtx: k(sv.rtxBitrate), audio: k(sv.audioBitrate) });
+  charts.bitrate.push(t, { target: k(sv.targetBitrate), sent: k(sv.sendBitrate), encoded: k(enc.bitrate), recv: k(stats.recvBitrate), rtx: k(sv.rtxBitrate), audio: k(sv.audioBitrate), layer: sim ? k(sim.layerBps) : null });
   charts.delay.push(t, { e2e: stats.e2eMs, audioE2e: audio && audio.e2eMs, owd: stats.owdMs, jbTarget: jb.targetMs, jbHold: jb.holdMs, rtt: stats.rttMs });
   charts.frames.push(t, { rendered: stats.renderedFps, encodedFps: enc.fps });
   for (const c of Object.values(charts)) c.draw(t);
@@ -428,6 +469,13 @@ function report() {
     ['freezes', S.n.freezes, `· ${fmtNum(S.n.freezeMs)} ms`],
     ['pacer queue', sv.queueMs, 'ms'],
     ['SCTP buffered', sv.sctpBufferedBytes, 'bytes'],
+    ...(sim ? [
+      ['simulcast layer', sim.layer + (sim.pending ? ` → ${sim.pending}` : ''), sim.layerBps ? `· ${sim.layerBps / 1000} kbps` : ''],
+      ['picture', S.picture || '–', ''],
+      ['video budget', k(sim.budgetBps), 'kbps'],
+      ['layer switches', sim.switches, ''],
+      ['waits for a keyframe', sim.keyframeWaits, sim.waitingForKey ? '· waiting' : ''],
+    ] : []),
     ...(audio ? [
       ['audio capture → heard', audio.e2eMs, 'ms'],
       ['video behind audio', audio.videoBehindAudioMs, 'ms'],

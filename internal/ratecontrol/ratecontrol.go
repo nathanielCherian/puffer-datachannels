@@ -11,6 +11,7 @@ package ratecontrol
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -105,7 +106,10 @@ func Names() []string {
 	return names
 }
 
-func init() { Register("fixed", func(cfg Config) Controller { return &Fixed{cfg: cfg} }) }
+func init() {
+	Register("fixed", func(cfg Config) Controller { return &Fixed{cfg: cfg} })
+	Register("sweep", func(cfg Config) Controller { return &Sweep{Fixed: Fixed{cfg: cfg}, start: time.Now()} })
+}
 
 // Fixed sends at StartBitrate no matter what the network does. It only
 // counts what it is told, as a template for a real controller.
@@ -151,4 +155,37 @@ func (f *Fixed) Stats() map[string]any {
 		"name": "fixed", "sent": f.sent, "acked": f.acked, "lost": f.lost,
 		"rttMs": float64(f.lastRTT.Microseconds()) / 1000, "delayVarMs": f.lastDelayVarMs,
 	}
+}
+
+// SweepPeriod is how long Sweep takes to go from MinBitrate to MaxBitrate and back.
+const SweepPeriod = 60 * time.Second
+
+// Sweep ignores the network, like Fixed, but its target moves: from MinBitrate
+// up to MaxBitrate and back down once every SweepPeriod, by the same ratio
+// every second, starting at the bottom. It is for exercising whatever follows
+// the target (the encoder's bitrate, which simulcast rendition is forwarded)
+// without a network that makes a real controller move.
+type Sweep struct {
+	Fixed
+	start time.Time
+}
+
+func (s *Sweep) TargetBitrate() int { return s.at(time.Since(s.start)) }
+
+func (s *Sweep) at(elapsed time.Duration) int {
+	lo, hi := float64(s.cfg.MinBitrate), float64(s.cfg.MaxBitrate)
+	if lo <= 0 || hi <= lo {
+		return s.cfg.StartBitrate
+	}
+	phase := math.Mod(elapsed.Seconds()/SweepPeriod.Seconds(), 1)
+	up := 1 - math.Abs(2*phase-1) // 0 at the bottom, 1 at the top
+	return int(lo * math.Pow(hi/lo, up))
+}
+
+func (s *Sweep) PacingRate() int { return int(float64(s.TargetBitrate()) * s.cfg.PacingFactor) }
+
+func (s *Sweep) Stats() map[string]any {
+	st := s.Fixed.Stats()
+	st["name"] = "sweep"
+	return st
 }
