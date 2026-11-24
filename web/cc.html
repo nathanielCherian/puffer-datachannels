@@ -8,7 +8,7 @@
 </head>
 <body>
 <header>
-  <h1>Congestion control <small>Copa, CUBIC, BBR or Vegas, junk data over an unreliable DataChannel · <a href="./">video page</a></small></h1>
+  <h1>Congestion control <small>Copa, CUBIC, BBR, Vegas or repeated slow start, junk data over an unreliable DataChannel · <a href="./">video page</a></small></h1>
   <div class="controls">
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
@@ -20,6 +20,7 @@
         <option value="cubic">CUBIC</option>
         <option value="bbr">BBR (v3)</option>
         <option value="vegas">Vegas</option>
+        <option value="slowstart">Slow start, repeated</option>
       </select>
     </label>
     <details class="settings">
@@ -34,7 +35,7 @@
           <option value="competitive">competitive: AIMD on 1/δ</option>
         </select>
       </label>
-      <label>Copa: δ in default mode (blank = server default; Copa queues about 1/δ packets) <input id="delta" type="number" min="0.01" max="2" step="0.05"></label>
+      <label>Copa: δ in default mode (blank = server default; Copa queues about 1/δ packets) <input id="delta" type="number" min="0.0001" max="2" step="any"></label>
       <label>Stop after (s, blank = until Stop or the server's limit) <input id="duration" type="number" min="1" step="5"></label>
       <label>STUN URL (optional) <input id="stun" type="text" placeholder="stun:stun.l.google.com:19302"></label>
     </details>

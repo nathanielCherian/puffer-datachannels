@@ -16,14 +16,15 @@ import (
 	"puffer-datachannels/internal/copa"
 	"puffer-datachannels/internal/cubic"
 	"puffer-datachannels/internal/logs"
+	"puffer-datachannels/internal/slowstart"
 	"puffer-datachannels/internal/vegas"
 	"puffer-datachannels/internal/wire"
 )
 
 // A congestion-control (cc) session is the transport on its own: no ffmpeg,
 // no encoder, no retransmission. The server always has data (junk) to send,
-// and a congestion controller (Copa, CUBIC, BBR or Vegas, each in its own
-// package under internal) decides how much of it goes out. The channel and the DATA format are the
+// and a congestion controller (Copa, CUBIC, BBR, Vegas or the repeated slow
+// start, each in its own package under internal) decides how much of it goes out. The channel and the DATA format are the
 // ones media uses, so everything said about SCTP in Settings holds here too;
 // the differences are on the return path:
 //
@@ -63,7 +64,7 @@ type sendObserver interface {
 }
 
 // Algorithms lists the congestion controllers a session can run.
-func Algorithms() []string { return []string{"copa", "cubic", "bbr", "vegas"} }
+func Algorithms() []string { return []string{"copa", "cubic", "bbr", "vegas", "slowstart"} }
 
 // ValidAlgorithm reports whether name is one of Algorithms.
 func ValidAlgorithm(name string) bool {
@@ -81,7 +82,7 @@ func ValidAlgorithm(name string) bool {
 type CCRequest struct {
 	SDP         string          `json:"sdp"`
 	Type        string          `json:"type"`
-	Algorithm   string          `json:"algorithm,omitempty"`   // copa, cubic, bbr, vegas
+	Algorithm   string          `json:"algorithm,omitempty"`   // copa, cubic, bbr, vegas, slowstart
 	MaxRate     int             `json:"maxRate,omitempty"`     // bps of DataChannel messages; at most the server's
 	Mode        string          `json:"mode,omitempty"`        // Copa: default, auto, competitive
 	Delta       float64         `json:"delta,omitempty"`       // Copa: δ in default mode
@@ -143,8 +144,8 @@ func (m *Manager) HandleCCOffer(ctx context.Context, req CCRequest, remoteAddr s
 		p.Mode = copa.Mode(req.Mode)
 	}
 	if req.Delta != 0 {
-		if req.Delta < 0.01 || req.Delta > 2 {
-			return nil, fmt.Errorf("%w: delta must be within 0.01..2", ErrBadOffer)
+		if req.Delta < copa.MinDelta || req.Delta > copa.MaxDelta {
+			return nil, fmt.Errorf("%w: delta must be within %v..%v", ErrBadOffer, copa.MinDelta, copa.MaxDelta)
 		}
 		p.Delta = req.Delta
 	}
@@ -295,6 +296,8 @@ func (s *CCSession) run(dc *webrtc.DataChannel) {
 		cc = bbr.New(bbr.Config{MaxRate: maxRate})
 	case "vegas":
 		cc = vegas.New(vegas.Config{MaxRate: maxRate})
+	case "slowstart":
+		cc = slowstart.New(slowstart.Config{MaxRate: maxRate})
 	default:
 		cc = copa.New(copa.Config{Delta: s.params.Delta, Mode: s.params.Mode, MaxRate: maxRate})
 	}
@@ -651,6 +654,10 @@ func (s *junkSender) snapshot() (map[string]any, junkCounters) {
 	case *vegas.Vegas:
 		st := cc.Stats()
 		snap["algorithm"], snap["vegas"] = "vegas", st
+		snap["windowBitrate"] = bps(st.CurrentRate)
+	case *slowstart.SlowStart:
+		st := cc.Stats()
+		snap["algorithm"], snap["slowstart"] = "slowstart", st
 		snap["windowBitrate"] = bps(st.CurrentRate)
 	}
 	return snap, s.c

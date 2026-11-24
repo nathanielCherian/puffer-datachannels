@@ -52,7 +52,7 @@ type Config struct {
 	ICEServers                           []webrtc.ICEServer `json:"-"`
 
 	// The congestion-control page (cc.go).
-	CCAlgorithm   string        // copa, cubic, bbr or vegas
+	CCAlgorithm   string        // copa, cubic, bbr, vegas or slowstart
 	CCMaxRate     int           // bps: the most a cc session may send
 	CCMaxDuration time.Duration // a cc session is closed after this long; 0 = never
 	CopaMode      string        // Copa: default, auto or competitive

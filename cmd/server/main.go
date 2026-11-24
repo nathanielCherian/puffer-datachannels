@@ -88,8 +88,8 @@ func main() {
 	if _, err := ratecontrol.New(*cc, ratecontrol.Config{}); err != nil {
 		log.Fatal(err)
 	}
-	if !copa.ValidMode(copa.Mode(*copaMode)) || *copaDelta < 0.01 || *copaDelta > 2 {
-		log.Fatal("--copa-mode must be default, auto or competitive, and --copa-delta within 0.01..2")
+	if !copa.ValidMode(copa.Mode(*copaMode)) || *copaDelta < copa.MinDelta || *copaDelta > copa.MaxDelta {
+		log.Fatalf("--copa-mode must be default, auto or competitive, and --copa-delta within %v..%v", copa.MinDelta, copa.MaxDelta)
 	}
 	if !session.ValidAlgorithm(*ccAlgorithm) || *ccMaxRate < *minBitrate {
 		log.Fatalf("--cc-algorithm must be one of %v, and --cc-max-rate at least --min-bitrate", session.Algorithms())
@@ -175,7 +175,7 @@ func main() {
 		writeOfferResponse(w, r, resp, err)
 	})
 	// The congestion-control page (web/cc.html): junk data under Copa, CUBIC,
-	// BBR or Vegas.
+	// BBR, Vegas or the repeated slow start.
 	mux.HandleFunc("POST /cc/offer", func(w http.ResponseWriter, r *http.Request) {
 		var req session.CCRequest
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {

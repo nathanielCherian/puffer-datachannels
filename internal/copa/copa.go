@@ -42,6 +42,15 @@ const (
 	ModeAuto Mode = "auto"
 )
 
+// The range of δ a caller may ask for. The paper uses 0.5 and, in competitive
+// mode, whatever AIMD arrives at; the floor is only there to keep 1/δ finite.
+// A small δ is a large standing queue (1/δ packets) and large steps (cwnd
+// moves by v/δ packets per round trip).
+const (
+	MinDelta = 0.0001
+	MaxDelta = 2
+)
+
 // Config holds Copa's constants. Zero fields take the defaults in brackets.
 type Config struct {
 	Delta        float64       // δ in default mode [0.5]

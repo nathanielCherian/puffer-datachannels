@@ -46,9 +46,9 @@ also be set as `PUFFER_<FLAG>`.
 | `--sctp-min-cwnd` | 64 MiB | floor for SCTP's congestion window; 0 leaves SCTP congestion control on |
 | `--emulate-loss`, `--emulate-delay` | 0 | testing: drop a fraction of outgoing media packets / hold every outgoing packet |
 | `--emulate-rate`, `--emulate-queue` | 0, 200ms | testing: a bottleneck of this many bps for everything the server sends, with a drop-tail buffer this long |
-| `--cc-algorithm` | `copa` | the congestion-control page: `copa`, `cubic`, `bbr` or `vegas` when the page does not choose |
+| `--cc-algorithm` | `copa` | the congestion-control page: `copa`, `cubic`, `bbr`, `vegas` or `slowstart` when the page does not choose |
 | `--cc-max-rate`, `--cc-max-duration` | 20000000, 10m | the congestion-control page: the most a session may send, and for how long |
-| `--copa-mode`, `--copa-delta` | `default`, 0.5 | Copa: how δ is chosen, and δ |
+| `--copa-mode`, `--copa-delta` | `default`, 0.5 | Copa: how δ is chosen, and δ (0.0001 to 2) |
 
 ## SCTP
 
@@ -114,7 +114,7 @@ old). Arrival times are on the browser's clock: use differences. Audio packets
 (`SentPacket.Audio`) share the sequence numbers and the pacer, and leave ahead
 of video.
 
-## Congestion control: Copa, CUBIC, BBR and Vegas
+## Congestion control: Copa, CUBIC, BBR, Vegas and a repeated slow start
 
 `/cc.html` is the transport without the media: the server sends random bytes
 as fast as a congestion controller allows, and the page acknowledges and
@@ -192,6 +192,15 @@ passes γ = 1; loss halves the window, once per window of losses. Constants,
 the Reno fallback for a round with too few samples and the pacing are
 Linux's. Like CUBIC, it does not grow a window that is not full.
 
+**Slow start, repeated** is `internal/slowstart`, and is an experiment rather
+than a published controller: the window doubles every round trip until a
+packet is lost, is cut to half of what it was when that packet left (not of
+what it has doubled to by the time the loss is noticed, which would still
+fill the buffer), is held for one second whatever is lost meanwhile, and then
+doubles again from there. Every cycle overshoots the path
+the way a connection's first slow start does, so the charts show what that
+costs once a second. A loss only ends a probe if the probe sent the packet.
+
 **Acks.** By default the page acknowledges each packet as it arrives. With
 "Acknowledge every N ms" in Settings it sends one message per interval naming
 every arrival of the interval and its arrival time (and the interval before
@@ -233,11 +242,12 @@ sender's state from its 100 ms snapshots: cwnd, packets in flight, RTTmin,
 smoothed RTT, pacing rate, and the controller's own (Copa: RTTstanding, δ,
 velocity, mode, target rate; CUBIC: ssthresh, W_max, K, congestion events;
 BBR: state, bw and max_bw, the gains, BDP, the long- and short-term bounds;
-Vegas: diff, ssthresh, what each round decided).
+Vegas: diff, ssthresh, what each round decided; the repeated slow start: the
+window the lost packet left at and the window when it was noticed, probes, losses it did not act on).
 The rate, delay and window charts mark two kinds of moment with vertical
 bars: a loss, at the time the page saw a later packet arrive in a missing
 one's place (drawn once the missing one has had 300 ms to turn up late), and
-the sender cutting its window (a CUBIC or Vegas congestion event, Copa in
+the sender cutting its window (a CUBIC or Vegas congestion event, a slow-start probe ending, Copa in
 competitive mode raising δ, BBR lowering a bound after loss, or a timeout). Each interval is a
 row in "Download metrics (CSV)" and a `stats` line in the session's
 `client.jsonl`; `cc.jsonl` has every packet (`sent`, `ack` with its RTT,
